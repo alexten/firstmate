@@ -121,10 +121,14 @@ fm_q_guard_release_child() {
 fm_q_guard_authorize_relaunch() {
   local key response result
   [ "${FM_Q_MANAGED:-0}" = 1 ] || return 0
-  key="firstmate-relaunch:$FM_Q_EXECUTION_ID:${FM_CONTROL_RELAUNCH_TX:-}"
   if [ -z "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "error: Q-managed relaunch requires a durable Firstmate relaunch transaction" >&2
     return 1
+  fi
+  if [ -n "${FM_Q_RELAUNCH_IDEMPOTENCY_KEY:-}" ]; then
+    key="firstmate-relaunch:$FM_Q_EXECUTION_ID:$FM_Q_RELAUNCH_IDEMPOTENCY_KEY"
+  else
+    key="firstmate-relaunch:$FM_Q_EXECUTION_ID:$FM_CONTROL_RELAUNCH_TX"
   fi
   if ! response=$("$FM_Q_CLI" guard retry \
       --data-dir "$FM_Q_DATA_DIR" \

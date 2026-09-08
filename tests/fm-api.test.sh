@@ -60,6 +60,9 @@ EOF
 for owner in fm-send.sh fm-control.sh fm-teardown.sh fm-merge-local.sh fm-pr-merge.sh; do
   cat >"$BIN/$owner" <<'EOF'
 #!/usr/bin/env bash
+if [ "${0##*/}" = fm-control.sh ] && [ -n "${FM_Q_RELAUNCH_IDEMPOTENCY_KEY:-}" ]; then
+  printf '%s\n' "$FM_Q_RELAUNCH_IDEMPOTENCY_KEY" >"$FM_HOME/state/relaunch-operation-key"
+fi
 printf 'owner diagnostic\n' >&2
 exit 0
 EOF
@@ -145,6 +148,8 @@ test_worker_relaunch_delegates_with_q_transport() {
   out=$(invoke worker.relaunch "$request") || fail "worker.relaunch failed"
   printf '%s\n' "$out" | jq -e '.postcondition_evidence.relaunch == "confirmed"' >/dev/null \
     || fail "worker relaunch evidence is invalid"
+  [ "$(cat "$HOME_ROOT/state/relaunch-operation-key")" = repair-1 ] \
+    || fail "worker relaunch did not propagate the stable facade operation key"
   pass "worker relaunch delegates through the lifecycle owner"
 }
 
@@ -241,6 +246,38 @@ test_q_guard_authorizes_each_relaunch_transaction() {
   pass "Q guard authorizes a durable relaunch transaction"
 }
 
+test_q_guard_reuses_facade_operation_key_across_transaction_recovery() {
+  local fake_q="$TMP_ROOT/fake-q-stable" key_one key_two
+  mkdir -p "$TMP_ROOT/q-data"
+  cat >"$fake_q" <<'SH'
+#!/usr/bin/env bash
+key=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --idempotency-key ]; then key=$2; shift 2; else shift; fi
+done
+printf '%s\n' "$key" >>"$FM_Q_DATA_DIR/retry-keys"
+jq -cn --arg key "$key" '{schema:"q.guard-retry-authorization.v1",result:"authorized",root_task_id:"task-root",execution_id:"exec-child",idempotency_key:$key,denial_reason:null}'
+SH
+  chmod +x "$fake_q"
+  (
+    # shellcheck source=bin/fm-q-guard-lib.sh
+    . "$BIN/fm-q-guard-lib.sh"
+    # shellcheck disable=SC2030,SC2031
+    export FM_Q_MANAGED=1 FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-child
+    # shellcheck disable=SC2030,SC2031
+    export FM_Q_CLI="$fake_q" FM_Q_DATA_DIR="$TMP_ROOT/q-data"
+    # shellcheck disable=SC2030,SC2031
+    export FM_Q_RELAUNCH_IDEMPOTENCY_KEY=validation-repair-task
+    FM_CONTROL_RELAUNCH_TX=tx-one fm_q_guard_authorize_relaunch
+    FM_CONTROL_RELAUNCH_TX=tx-two fm_q_guard_authorize_relaunch
+  ) || fail "stable facade relaunch key should authorize on recovery"
+  key_one=$(sed -n '1p' "$TMP_ROOT/q-data/retry-keys")
+  key_two=$(sed -n '2p' "$TMP_ROOT/q-data/retry-keys")
+  [ -n "$key_one" ] || fail "facade recovery must send a non-empty Q retry key"
+  [ "$key_one" = "$key_two" ] || fail "facade recovery must replay one Q retry key"
+  pass "Q relaunch recovery reuses the facade operation identity"
+}
+
 test_q_guard_refuses_denial_and_unavailable_contract() {
   calls="$TMP_ROOT/q-guard-denied.calls"
   fake_q="$TMP_ROOT/fake-q-denied"
@@ -330,6 +367,7 @@ test_worker_relaunch_delegates_with_q_transport
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
 test_q_guard_authorizes_propagates_and_releases
 test_q_guard_authorizes_each_relaunch_transaction
+test_q_guard_reuses_facade_operation_key_across_transaction_recovery
 test_q_guard_refuses_denial_and_unavailable_contract
 test_supervisor_operations_use_secondmate_owners_and_structured_events
 test_delivery_delegates_to_confirming_merge_owner

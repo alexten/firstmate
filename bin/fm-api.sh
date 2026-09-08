@@ -238,6 +238,7 @@ PY
   worker.relaunch)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
     note=$(jq -r '.note // empty' "$REQUEST_FILE")
+    relaunch_key=$(jq -r '.idempotency_key // empty' "$REQUEST_FILE")
     q_cli=$(jq -r '.q.guard_executable // empty' "$REQUEST_FILE")
     q_data_dir=$(jq -r '.q.data_dir // empty' "$REQUEST_FILE")
     [ -n "$note" ] && [ -n "$q_cli" ] && [ -n "$q_data_dir" ] || {
@@ -245,6 +246,7 @@ PY
       exit 2
     }
     run_owner env FM_HOME="$FM_HOME" FM_Q_CLI="$q_cli" FM_Q_DATA_DIR="$q_data_dir" \
+      FM_Q_RELAUNCH_IDEMPOTENCY_KEY="$relaunch_key" \
       "$SCRIPT_DIR/fm-control.sh" "$task_id" relaunch --note "$note" || exit $?
     respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,relaunch:"confirmed"}')"
     ;;

@@ -326,6 +326,11 @@
 #   identity is owned by the parent home that holds its task metadata, while the
 #   pane export happens on the remote host (bin/fm-remote-secondmate-control.sh).
 #   Local spawns never pass it and resolve their own carrier exactly as before.
+# Q-managed metadata: when FM_Q_MANAGED=1, a fresh ship or scout spawn requires
+# the complete validated Q identity supplied by bin/fm-api.sh and records it in
+# the task metadata publication. Ordinary spawns do not read or write Q fields.
+# The Q lease guard for supervised child authorization is owned separately by
+# bin/fm-q-guard-lib.sh; metadata is identity evidence, never authorization.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -377,6 +382,39 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+Q_MANAGED=0
+if [ "${FM_Q_MANAGED:-}" = 1 ]; then
+  Q_MANAGED=1
+  for q_name in FM_Q_ROOT_TASK_ID FM_Q_EXECUTION_ID FM_Q_LEASE_ID FM_Q_PHASE; do
+    q_value=${!q_name:-}
+    case "$q_value" in
+      ''|*[!A-Za-z0-9._:-]*)
+        echo "error: Q-managed spawn requires a safe non-empty $q_name" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [ "${FM_Q_CONTRACT_SCHEMA:-}" != q.worker-contract.v1 ]; then
+    echo "error: Q-managed spawn requires FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1" >&2
+    exit 1
+  fi
+  case "$FM_Q_PHASE" in
+    investigation|implementation|supervision|validation) ;;
+    *) echo "error: Q-managed spawn has invalid FM_Q_PHASE" >&2; exit 1 ;;
+  esac
+  case "${FM_Q_PARENT_EXECUTION_ID:-}" in
+    *[!A-Za-z0-9._:-]*)
+      echo "error: Q-managed spawn has invalid FM_Q_PARENT_EXECUTION_ID" >&2
+      exit 1
+      ;;
+  esac
+  case "${FM_Q_TRACE_ID:-}" in
+    *[!A-Za-z0-9._:-]*)
+      echo "error: Q-managed spawn has invalid FM_Q_TRACE_ID" >&2
+      exit 1
+      ;;
+  esac
+fi
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 if ! LAUNCH_ENV_ENABLED=$(fm_config_source_present "$CONFIG/launch-env-allowlist"); then
@@ -3585,6 +3623,15 @@ preserve_relaunch_meta() {
   echo "effort=${EFFORT:-default}"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
+  if [ "$Q_MANAGED" = 1 ] && [ "$RELAUNCH" -eq 0 ]; then
+    echo "q_root_task_id=$FM_Q_ROOT_TASK_ID"
+    echo "q_execution_id=$FM_Q_EXECUTION_ID"
+    [ -z "${FM_Q_PARENT_EXECUTION_ID:-}" ] || echo "q_parent_execution_id=$FM_Q_PARENT_EXECUTION_ID"
+    echo "q_lease_id=$FM_Q_LEASE_ID"
+    echo "q_phase=$FM_Q_PHASE"
+    echo "q_contract_schema=$FM_Q_CONTRACT_SCHEMA"
+    [ -z "${FM_Q_TRACE_ID:-}" ] || echo "q_trace_id=$FM_Q_TRACE_ID"
+  fi
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;

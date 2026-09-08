@@ -2,8 +2,8 @@
 # Versioned machine-readable facade for Quartermaster.
 # Usage: fm-api.sh capabilities
 #        fm-api.sh <operation> < request.json
-# Supported operations are fleet.snapshot, worker.prepare, worker.spawn,
-# worker.inspect, worker.send, worker.control, and worker.cleanup.
+# Supported operations are fleet.snapshot, worker lifecycle, and supervisor
+# prepare/start/send/inspect/stop.
 # Requests use schema q.firstmate-request.v1 and must name the invoked operation.
 # Successful stdout contains exactly one fm-api-response.v1 JSON object.
 # Owner diagnostics are forwarded to stderr and never mixed into the response.
@@ -62,6 +62,13 @@ run_owner() {
   fi
   owner_rc=$?
   cat "$OWNER_ERR" >&2
+  guard_result=$(sed -n 's/^Q_GUARD_RESULT=//p' "$OWNER_ERR" | tail -n 1)
+  if [ -n "$guard_result" ] && jq -e '.schema == "q.guard-authorization.v1"' \
+      >/dev/null 2>&1 <<<"$guard_result"; then
+    respond refused "$(jq -cn --argjson guard "$guard_result" '{guard:$guard}')" \
+      '"Quartermaster denied the child spawn"' '"reduce or revise the root envelope"'
+    return "$owner_rc"
+  fi
   owner_error=$(jq -Rs . <"$OWNER_ERR")
   respond error null "$owner_error" '"inspect owner diagnostics and retry only after reconciliation"'
   return "$owner_rc"
@@ -82,7 +89,7 @@ case "$OPERATION" in
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
     ;;
-  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.send|worker.control|worker.cleanup) ;;
+  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.send|worker.control|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop) ;;
   *)
     OPERATION=${OPERATION:-unknown}
     respond refused null '"unsupported operation"' null
@@ -205,5 +212,99 @@ PY
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
     run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-teardown.sh" "$task_id" || exit $?
     respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,cleanup:"confirmed"}')"
+    ;;
+  supervisor.prepare)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    project_name=$(jq -r '.project_name // empty' "$REQUEST_FILE")
+    supervisor_home=$(jq -r '.supervisor_home // empty' "$REQUEST_FILE")
+    root_task_id=$(jq -r '.root_task_id // empty' "$REQUEST_FILE")
+    captain_intent=$(jq -r '.captain_intent // empty' "$REQUEST_FILE")
+    execution_spec=$(jq -r '.execution_spec // empty' "$REQUEST_FILE")
+    case "$supervisor_home" in /*) ;; *) respond refused null '"supervisor_home must be absolute"' null; exit 2 ;; esac
+    case "$project_name" in ''|*[!A-Za-z0-9._-]*) respond refused null '"invalid supervisor project name"' null; exit 2 ;; esac
+    [ -d "$FM_HOME/projects/$project_name" ] || {
+      respond refused null '"supervisor project mirror is missing"' '"prepare the isolated controller mirror and retry"'
+      exit 2
+    }
+    if [ -f "$supervisor_home/.fm-secondmate-home" ] \
+       && [ "$(cat "$supervisor_home/.fm-secondmate-home")" = "$task_id" ]; then
+      respond ok "$(jq -cn --arg home "$supervisor_home" --arg events "$supervisor_home/state/q-supervisor-events.jsonl" '{supervisor_home:$home,events_path:$events,reused:true}')"
+      exit 0
+    fi
+    charter=$(printf '%s\n\n%s\n\n%s\n' "$captain_intent" "$execution_spec" \
+      "Write only q.supervisor-event.v1 JSON objects, one per line with consecutive sequence numbers, to state/q-supervisor-events.jsonl. Every event must carry root_task_id=$root_task_id. Use accepted, child_proposed, child_lease_denied, decision_required, blocked, validation_ready, delivery_ready, failed, or completed. Q alone authorizes child leases, budgets, validation, and delivery.")
+    run_owner env FM_HOME="$FM_HOME" FM_SECONDMATE_CHARTER="$charter" \
+      FM_SECONDMATE_SCOPE="Quartermaster root $root_task_id only." \
+      "$SCRIPT_DIR/fm-home-seed.sh" "$task_id" "$supervisor_home" "$project_name" || exit $?
+    respond ok "$(jq -cn --arg home "$supervisor_home" --arg events "$supervisor_home/state/q-supervisor-events.jsonl" '{supervisor_home:$home,events_path:$events,reused:false}')"
+    ;;
+  supervisor.start)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    supervisor_home=$(jq -r '.supervisor_home // empty' "$REQUEST_FILE")
+    harness=$(jq -r '.harness // empty' "$REQUEST_FILE")
+    model=$(jq -r '.model // empty' "$REQUEST_FILE")
+    effort=$(jq -r '.effort // empty' "$REQUEST_FILE")
+    q_root=$(jq -r '.q.root_task_id // empty' "$REQUEST_FILE")
+    q_execution=$(jq -r '.q.execution_id // empty' "$REQUEST_FILE")
+    q_lease=$(jq -r '.q.lease_id // empty' "$REQUEST_FILE")
+    q_wall=$(jq -r '.q.expected_wall_seconds // empty' "$REQUEST_FILE")
+    q_cli=$(jq -r '.q.guard_executable // empty' "$REQUEST_FILE")
+    q_data_dir=$(jq -r '.q.data_dir // empty' "$REQUEST_FILE")
+    [ -n "$q_cli" ] && [ -n "$q_data_dir" ] || {
+      respond refused null '"supervisor requires the Q child guard transport"' null
+      exit 2
+    }
+    run_owner env FM_HOME="$FM_HOME" FM_Q_MANAGED=1 FM_Q_PREAUTHORIZED=1 \
+      FM_Q_ROOT_TASK_ID="$q_root" FM_Q_EXECUTION_ID="$q_execution" \
+      FM_Q_LEASE_ID="$q_lease" FM_Q_PHASE=supervision FM_Q_DEPTH=0 \
+      FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1 FM_Q_DELEGATION_ENABLED=1 \
+      FM_Q_EXPECTED_WALL_SECONDS="$q_wall" FM_Q_CLI="$q_cli" FM_Q_DATA_DIR="$q_data_dir" \
+      "$SCRIPT_DIR/fm-spawn.sh" "$task_id" --secondmate --harness "$harness" \
+      --model "$model" --effort "$effort" || exit $?
+    meta="$FM_HOME/state/$task_id.meta"
+    if [ ! -f "$meta" ] || ! grep -Fqx "home=$supervisor_home" "$meta" \
+       || ! grep -Fqx "q_lease_id=$q_lease" "$meta"; then
+      respond partial null '"supervisor launched but metadata confirmation is incomplete"' '"inspect before retrying"'
+      exit 4
+    fi
+    respond ok "$(jq -cn --arg task_id "$task_id" --arg home "$supervisor_home" '{task_id:$task_id,supervisor_home:$home}')"
+    ;;
+  supervisor.inspect)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    supervisor_home=$(jq -r '.supervisor_home // empty' "$REQUEST_FILE")
+    meta="$FM_HOME/state/$task_id.meta"
+    [ -f "$meta" ] || { respond refused null '"supervisor metadata is missing"' '"reconcile the supervisor launch"'; exit 3; }
+    root_task_id=$(sed -n 's/^q_root_task_id=//p' "$meta")
+    [ -n "$root_task_id" ] || { respond error null '"supervisor Q root metadata is missing"' null; exit 1; }
+    run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json || exit $?
+    task=$(jq -c --arg id "$task_id" '[.tasks[] | select(.id == $id)][0] // null' "$OWNER_OUT")
+    live=false
+    [ "$task" = null ] || live=true
+    events_file="$supervisor_home/state/q-supervisor-events.jsonl"
+    events='[]'
+    if [ -s "$events_file" ]; then
+      if ! events=$(jq -sc --arg root "$root_task_id" '
+          if all(.[]; .schema == "q.supervisor-event.v1" and
+            .root_task_id == $root and (.sequence | type == "number")) then .
+          else error("invalid supervisor event stream") end
+        ' "$events_file" 2>/dev/null); then
+        respond error null '"supervisor event stream is invalid"' '"preserve the stream and reconcile it"'
+        exit 1
+      fi
+    fi
+    respond ok "$(jq -cn --arg root "$root_task_id" --arg external "$task_id" \
+      --argjson live "$live" --argjson events "$events" \
+      '{schema:"q.supervisor-snapshot.v1",root_task_id:$root,external_id:$external,live:$live,events:$events}')"
+    ;;
+  supervisor.send)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    message=$(jq -r '.message // empty' "$REQUEST_FILE")
+    run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-send.sh" "$task_id" "$message" || exit $?
+    respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,delivery:"durably_recorded"}')"
+    ;;
+  supervisor.stop)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-control.sh" "$task_id" exit || exit $?
+    respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true}')"
     ;;
 esac

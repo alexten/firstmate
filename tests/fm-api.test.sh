@@ -34,12 +34,27 @@ mkdir -p "$home/state"
   printf 'q_lease_id=%s\n' "${FM_Q_LEASE_ID:?}"
   printf 'q_phase=%s\n' "${FM_Q_PHASE:?}"
   printf 'q_contract_schema=%s\n' "${FM_Q_CONTRACT_SCHEMA:?}"
+  if printf '%s\n' "$*" | grep -F -- '--secondmate' >/dev/null; then
+    printf 'home=%s\n' "$(cat "$home/state/q-supervisor-home")"
+  fi
 } >"$home/state/$id.meta"
+EOF
+
+cat >"$BIN/fm-home-seed.sh" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+controller=${FM_HOME:?}
+id=$1
+home=$2
+mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+printf '%s\n' "$id" >"$home/.fm-secondmate-home"
+printf '%s\n' "$home" >"$controller/state/q-supervisor-home"
+printf 'home=%s\n' "$home"
 EOF
 
 cat >"$BIN/fm-fleet-snapshot.sh" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' '{"schema":"fm-fleet-snapshot.v1","tasks":[{"id":"worker-1","current_state":{"state":"working"}}]}'
+printf '%s\n' '{"schema":"fm-fleet-snapshot.v1","tasks":[{"id":"worker-1","current_state":{"state":"working"}},{"id":"supervisor-1","current_state":{"state":"working"}}]}'
 EOF
 
 for owner in fm-send.sh fm-control.sh fm-teardown.sh; do
@@ -155,6 +170,8 @@ case "$operation" in
 esac
 EOF
   chmod +x "$fake_q"
+  # Q identity mutations are intentionally confined to this test subshell.
+  # shellcheck disable=SC2030
   (
     # shellcheck source=bin/fm-q-guard-lib.sh
     . "$BIN/fm-q-guard-lib.sh"
@@ -179,7 +196,10 @@ test_q_guard_refuses_denial_and_unavailable_contract() {
   fake_q="$TMP_ROOT/fake-q-denied"
   cp "$TMP_ROOT/fake-q" "$fake_q"
   chmod +x "$fake_q"
+  # The denial case uses a fresh subshell and does not consume the prior case's identity.
+  # shellcheck disable=SC2031
   out=$({
+    # shellcheck disable=SC1091
     . "$BIN/fm-q-guard-lib.sh"
     export FM_Q_DELEGATION_ENABLED=1 FM_Q_PREAUTHORIZED=0
     export FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-parent
@@ -209,6 +229,39 @@ test_q_guard_refuses_denial_and_unavailable_contract() {
   pass "Q guard refuses budget denial and an unavailable contract before mutation"
 }
 
+test_supervisor_operations_use_secondmate_owners_and_structured_events() {
+  supervisor_home="$TMP_ROOT/supervisor-home"
+  mkdir -p "$HOME_ROOT/projects/q-project"
+  request='{"schema":"q.firstmate-request.v1","operation":"supervisor.prepare","idempotency_key":"supervisor-prepare-1","task_id":"supervisor-1","repository":"/repo","project_name":"q-project","supervisor_home":"'"$supervisor_home"'","root_task_id":"task-root","captain_intent":"Coordinate it.","execution_spec":"Remain bounded."}'
+  out=$(invoke supervisor.prepare "$request") || fail "supervisor.prepare failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.reused == false' >/dev/null \
+    || fail "supervisor prepare evidence is invalid"
+  [ "$(cat "$supervisor_home/.fm-secondmate-home")" = supervisor-1 ] \
+    || fail "supervisor home owner did not provision the home"
+
+  request='{"schema":"q.firstmate-request.v1","operation":"supervisor.start","idempotency_key":"supervisor-start-1","task_id":"supervisor-1","repository":"/repo","supervisor_home":"'"$supervisor_home"'","harness":"codex","model":"default","effort":"high","q":{"root_task_id":"task-root","execution_id":"exec-supervisor","lease_id":"lease-supervisor","expected_wall_seconds":600,"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
+  out=$(invoke supervisor.start "$request") || fail "supervisor.start failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.task_id == "supervisor-1"' >/dev/null \
+    || fail "supervisor start evidence is invalid"
+  grep -Fqx "home=$supervisor_home" "$HOME_ROOT/state/supervisor-1.meta" \
+    || fail "supervisor metadata did not retain its dedicated home"
+
+  printf '%s\n' '{"schema":"q.supervisor-event.v1","sequence":1,"event":"accepted","root_task_id":"task-root","message":"accepted","data":{}}' \
+    >"$supervisor_home/state/q-supervisor-events.jsonl"
+  request='{"schema":"q.firstmate-request.v1","operation":"supervisor.inspect","idempotency_key":"supervisor-inspect-1","task_id":"supervisor-1","supervisor_home":"'"$supervisor_home"'"}'
+  out=$(invoke supervisor.inspect "$request") || fail "supervisor.inspect failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.schema == "q.supervisor-snapshot.v1" and .postcondition_evidence.live == true and .postcondition_evidence.events[0].event == "accepted"' >/dev/null \
+    || fail "supervisor inspect did not return versioned structured events"
+
+  base='{"schema":"q.firstmate-request.v1","idempotency_key":"supervisor-operation-1"'
+  out=$(invoke supervisor.send "$base,"'"operation":"supervisor.send","task_id":"supervisor-1","message":"continue"}') || fail "supervisor.send failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null || fail "supervisor send response invalid"
+  out=$(invoke supervisor.stop "$base,"'"operation":"supervisor.stop","task_id":"supervisor-1"}') || fail "supervisor.stop failed"
+  printf '%s\n' "$out" | jq -e '.postcondition_evidence.confirmed == true' >/dev/null \
+    || fail "supervisor stop was not confirmed"
+  pass "supervisor operations reuse secondmate owners and expose structured events"
+}
+
 test_capabilities_are_one_versioned_json_object
 test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
@@ -217,3 +270,4 @@ test_snapshot_inspect_and_lifecycle_delegation
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
 test_q_guard_authorizes_propagates_and_releases
 test_q_guard_refuses_denial_and_unavailable_contract
+test_supervisor_operations_use_secondmate_owners_and_structured_events

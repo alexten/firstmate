@@ -92,7 +92,7 @@ case "$OPERATION" in
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
     ;;
-  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.result|worker.send|worker.control|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
+  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.result|worker.send|worker.control|worker.relaunch|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
   *)
     OPERATION=${OPERATION:-unknown}
     respond refused null '"unsupported operation"' null
@@ -234,6 +234,19 @@ PY
     case "$verb" in interrupt|exit) ;; *) respond refused null '"unsupported control verb"' null; exit 2 ;; esac
     run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-control.sh" "$task_id" "$verb" || exit $?
     respond ok "$(jq -cn --arg task_id "$task_id" --arg verb "$verb" '{task_id:$task_id,control:$verb,confirmed:true}')"
+    ;;
+  worker.relaunch)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    note=$(jq -r '.note // empty' "$REQUEST_FILE")
+    q_cli=$(jq -r '.q.guard_executable // empty' "$REQUEST_FILE")
+    q_data_dir=$(jq -r '.q.data_dir // empty' "$REQUEST_FILE")
+    [ -n "$note" ] && [ -n "$q_cli" ] && [ -n "$q_data_dir" ] || {
+      respond refused null '"worker relaunch requires a note and Q guard transport"' null
+      exit 2
+    }
+    run_owner env FM_HOME="$FM_HOME" FM_Q_CLI="$q_cli" FM_Q_DATA_DIR="$q_data_dir" \
+      "$SCRIPT_DIR/fm-control.sh" "$task_id" relaunch --note "$note" || exit $?
+    respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,relaunch:"confirmed"}')"
     ;;
   worker.cleanup)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")

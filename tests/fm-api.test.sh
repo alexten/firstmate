@@ -140,6 +140,14 @@ test_snapshot_inspect_and_lifecycle_delegation() {
   pass "snapshot and worker lifecycle calls delegate through typed responses"
 }
 
+test_worker_relaunch_delegates_with_q_transport() {
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.relaunch","idempotency_key":"repair-1","task_id":"worker-1","note":"Repair failed validation.","q":{"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
+  out=$(invoke worker.relaunch "$request") || fail "worker.relaunch failed"
+  printf '%s\n' "$out" | jq -e '.postcondition_evidence.relaunch == "confirmed"' >/dev/null \
+    || fail "worker relaunch evidence is invalid"
+  pass "worker relaunch delegates through the lifecycle owner"
+}
+
 test_q_spawn_validation_is_opt_in_and_precedes_mutation() {
   home="$TMP_ROOT/real-home"
   mkdir -p "$home"
@@ -317,6 +325,7 @@ test_prepare_delegates_and_renders_contract
 test_worker_result_validates_durable_identity
 test_spawn_requires_metadata_postcondition
 test_snapshot_inspect_and_lifecycle_delegation
+test_worker_relaunch_delegates_with_q_transport
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
 test_q_guard_authorizes_propagates_and_releases
 test_q_guard_authorizes_each_relaunch_transaction

@@ -57,7 +57,7 @@ cat >"$BIN/fm-fleet-snapshot.sh" <<'EOF'
 printf '%s\n' '{"schema":"fm-fleet-snapshot.v1","tasks":[{"id":"worker-1","current_state":{"state":"working"}},{"id":"supervisor-1","current_state":{"state":"working"}}]}'
 EOF
 
-for owner in fm-send.sh fm-control.sh fm-teardown.sh; do
+for owner in fm-send.sh fm-control.sh fm-teardown.sh fm-merge-local.sh fm-pr-merge.sh; do
   cat >"$BIN/$owner" <<'EOF'
 #!/usr/bin/env bash
 printf 'owner diagnostic\n' >&2
@@ -167,6 +167,13 @@ case "$operation" in
   commit)
     printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-child","external_task_id":"child-one","requested_depth":1,"lease_id":"lease-child","lease_state":"committed","denial_reason":null}'
     ;;
+  retry)
+    if [ "${FM_Q_FAKE_RESULT:-authorized}" = denied ]; then
+      printf '%s\n' '{"schema":"q.guard-retry-authorization.v1","result":"denied","root_task_id":"task-root","execution_id":"exec-child","idempotency_key":"firstmate-relaunch:exec-child:tx-one","denial_reason":"retry_budget_exhausted"}'
+    else
+      printf '%s\n' '{"schema":"q.guard-retry-authorization.v1","result":"authorized","root_task_id":"task-root","execution_id":"exec-child","idempotency_key":"firstmate-relaunch:exec-child:tx-one","denial_reason":null}'
+    fi
+    ;;
 esac
 EOF
   chmod +x "$fake_q"
@@ -189,6 +196,25 @@ EOF
   [ "$(tr '\n' ' ' <"$calls")" = "authorize release " ] \
     || fail "Q guard did not use the expected authorization lifecycle"
   pass "Q guard propagates child identity and releases an aborted launch"
+}
+
+test_q_guard_authorizes_each_relaunch_transaction() {
+  calls="$TMP_ROOT/q-guard-retry.calls"
+  fake_q="$TMP_ROOT/fake-q"
+  (
+    # shellcheck source=bin/fm-q-guard-lib.sh
+    . "$BIN/fm-q-guard-lib.sh"
+    # shellcheck disable=SC2030,SC2031
+    export FM_Q_MANAGED=1 FM_Q_ROOT_TASK_ID=task-root
+    export FM_Q_EXECUTION_ID=exec-child FM_CONTROL_RELAUNCH_TX=tx-one
+    # shellcheck disable=SC2030,SC2031
+    export FM_Q_CLI="$fake_q" FM_Q_DATA_DIR="$TMP_ROOT/q-data"
+    # shellcheck disable=SC2030,SC2031
+    export FM_Q_FAKE_CALLS="$calls"
+    fm_q_guard_authorize_relaunch
+  ) || fail "Q guard did not authorize the relaunch transaction"
+  [ "$(cat "$calls")" = retry ] || fail "Q guard did not call the retry boundary"
+  pass "Q guard authorizes a durable relaunch transaction"
 }
 
 test_q_guard_refuses_denial_and_unavailable_contract() {
@@ -262,6 +288,14 @@ test_supervisor_operations_use_secondmate_owners_and_structured_events() {
   pass "supervisor operations reuse secondmate owners and expose structured events"
 }
 
+test_delivery_delegates_to_confirming_merge_owner() {
+  request='{"schema":"q.firstmate-request.v1","operation":"delivery.execute","idempotency_key":"delivery-1","task_id":"worker-1","action":"land","mode":"local-only"}'
+  out=$(invoke delivery.execute "$request") || fail "local delivery failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.confirmed == true and .postcondition_evidence.action == "land"' >/dev/null \
+    || fail "delivery did not return a confirmed postcondition"
+  pass "delivery delegates to the confirming Firstmate merge owner"
+}
+
 test_capabilities_are_one_versioned_json_object
 test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
@@ -269,5 +303,7 @@ test_spawn_requires_metadata_postcondition
 test_snapshot_inspect_and_lifecycle_delegation
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
 test_q_guard_authorizes_propagates_and_releases
+test_q_guard_authorizes_each_relaunch_transaction
 test_q_guard_refuses_denial_and_unavailable_contract
 test_supervisor_operations_use_secondmate_owners_and_structured_events
+test_delivery_delegates_to_confirming_merge_owner

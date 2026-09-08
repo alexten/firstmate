@@ -2,8 +2,8 @@
 # Versioned machine-readable facade for Quartermaster.
 # Usage: fm-api.sh capabilities
 #        fm-api.sh <operation> < request.json
-# Supported operations are fleet.snapshot, worker lifecycle, and supervisor
-# prepare/start/send/inspect/stop.
+# Supported operations are fleet.snapshot, worker lifecycle, supervisor
+# prepare/start/send/inspect/stop, and approved delivery execution.
 # Requests use schema q.firstmate-request.v1 and must name the invoked operation.
 # Successful stdout contains exactly one fm-api-response.v1 JSON object.
 # Owner diagnostics are forwarded to stderr and never mixed into the response.
@@ -63,10 +63,13 @@ run_owner() {
   owner_rc=$?
   cat "$OWNER_ERR" >&2
   guard_result=$(sed -n 's/^Q_GUARD_RESULT=//p' "$OWNER_ERR" | tail -n 1)
-  if [ -n "$guard_result" ] && jq -e '.schema == "q.guard-authorization.v1"' \
+  if [ -n "$guard_result" ] && jq -e '
+      .schema == "q.guard-authorization.v1" or
+      .schema == "q.guard-retry-authorization.v1"
+    ' \
       >/dev/null 2>&1 <<<"$guard_result"; then
     respond refused "$(jq -cn --argjson guard "$guard_result" '{guard:$guard}')" \
-      '"Quartermaster denied the child spawn"' '"reduce or revise the root envelope"'
+      '"Quartermaster denied the guarded operation"' '"reduce or revise the root envelope"'
     return "$owner_rc"
   fi
   owner_error=$(jq -Rs . <"$OWNER_ERR")
@@ -89,7 +92,7 @@ case "$OPERATION" in
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
     ;;
-  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.send|worker.control|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop) ;;
+  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.send|worker.control|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
   *)
     OPERATION=${OPERATION:-unknown}
     respond refused null '"unsupported operation"' null
@@ -306,5 +309,27 @@ PY
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
     run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-control.sh" "$task_id" exit || exit $?
     respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true}')"
+    ;;
+  delivery.execute)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    action=$(jq -r '.action // empty' "$REQUEST_FILE")
+    mode=$(jq -r '.mode // empty' "$REQUEST_FILE")
+    case "$action:$mode" in
+      land:local-only)
+        run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-merge-local.sh" "$task_id" || exit $?
+        ;;
+      merge:direct-PR|merge:no-mistakes)
+        meta="$FM_HOME/state/$task_id.meta"
+        [ -f "$meta" ] || { respond refused null '"delivery metadata is missing"' null; exit 3; }
+        pr_url=$(sed -n 's/^pr=//p' "$meta")
+        [ -n "$pr_url" ] || { respond refused null '"task has no recorded pull request"' '"wait for PR-ready evidence"'; exit 3; }
+        run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-pr-merge.sh" "$task_id" "$pr_url" || exit $?
+        ;;
+      *) respond refused null '"delivery action and mode are incompatible"' null; exit 2 ;;
+    esac
+    owner_output=$(jq -Rs . <"$OWNER_OUT")
+    respond ok "$(jq -cn --arg task_id "$task_id" --arg action "$action" \
+      --arg mode "$mode" --argjson owner_output "$owner_output" \
+      '{task_id:$task_id,action:$action,mode:$mode,confirmed:true,owner_output:$owner_output}')"
     ;;
 esac

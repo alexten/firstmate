@@ -117,3 +117,37 @@ fm_q_guard_release_child() {
     }
   FM_Q_GUARD_ACQUIRED=0
 }
+
+fm_q_guard_authorize_relaunch() {
+  local key response result
+  [ "${FM_Q_MANAGED:-0}" = 1 ] || return 0
+  key="firstmate-relaunch:$FM_Q_EXECUTION_ID:${FM_CONTROL_RELAUNCH_TX:-}"
+  if [ -z "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
+    echo "error: Q-managed relaunch requires a durable Firstmate relaunch transaction" >&2
+    return 1
+  fi
+  if ! response=$("$FM_Q_CLI" guard retry \
+      --data-dir "$FM_Q_DATA_DIR" \
+      --root-task-id "$FM_Q_ROOT_TASK_ID" \
+      --execution-id "$FM_Q_EXECUTION_ID" \
+      --idempotency-key "$key"); then
+    echo "error: Q retry authorization is unavailable; relaunch refused before launch" >&2
+    return 1
+  fi
+  if ! jq -e '
+      type == "object" and .schema == "q.guard-retry-authorization.v1" and
+      (.result == "authorized" or .result == "denied") and
+      .root_task_id == $root and .execution_id == $execution and
+      (.idempotency_key | type == "string" and length > 0)
+    ' --arg root "$FM_Q_ROOT_TASK_ID" --arg execution "$FM_Q_EXECUTION_ID" \
+      >/dev/null 2>&1 <<<"$response"; then
+    echo "error: Q retry authorization returned an incompatible response" >&2
+    return 1
+  fi
+  result=$(jq -r .result <<<"$response")
+  if [ "$result" != authorized ]; then
+    printf 'Q_GUARD_RESULT=%s\n' "$(jq -c . <<<"$response")" >&2
+    echo "error: Q denied relaunch of $FM_Q_EXECUTION_ID before launch" >&2
+    return 3
+  fi
+}

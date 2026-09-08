@@ -1340,6 +1340,42 @@ if [ "$RELAUNCH" -eq 1 ]; then
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
+  RELAUNCH_Q_SCHEMA=$(fm_meta_get "$RELAUNCH_META" q_contract_schema)
+  if [ -n "$RELAUNCH_Q_SCHEMA" ]; then
+    [ "$RELAUNCH_Q_SCHEMA" = q.worker-contract.v1 ] || {
+      echo "error: task $ID has an unsupported Q contract; refusing to relaunch" >&2
+      exit 1
+    }
+    Q_MANAGED=1
+    FM_Q_MANAGED=1
+    FM_Q_ROOT_TASK_ID=$(fm_meta_get "$RELAUNCH_META" q_root_task_id)
+    FM_Q_EXECUTION_ID=$(fm_meta_get "$RELAUNCH_META" q_execution_id)
+    FM_Q_PARENT_EXECUTION_ID=$(fm_meta_get "$RELAUNCH_META" q_parent_execution_id)
+    FM_Q_LEASE_ID=$(fm_meta_get "$RELAUNCH_META" q_lease_id)
+    FM_Q_PHASE=$(fm_meta_get "$RELAUNCH_META" q_phase)
+    FM_Q_DEPTH=$(fm_meta_get "$RELAUNCH_META" q_depth)
+    FM_Q_CONTRACT_SCHEMA=$RELAUNCH_Q_SCHEMA
+    export FM_Q_MANAGED FM_Q_ROOT_TASK_ID FM_Q_EXECUTION_ID
+    export FM_Q_PARENT_EXECUTION_ID FM_Q_LEASE_ID FM_Q_PHASE FM_Q_DEPTH
+    export FM_Q_CONTRACT_SCHEMA
+    for q_name in FM_Q_ROOT_TASK_ID FM_Q_EXECUTION_ID FM_Q_LEASE_ID FM_Q_PHASE FM_Q_DEPTH; do
+      q_value=${!q_name:-}
+      case "$q_value" in
+        ''|*[!A-Za-z0-9._:-]*)
+          echo "error: task $ID has invalid Q identity $q_name; refusing to relaunch" >&2
+          exit 1
+          ;;
+      esac
+    done
+    case "${FM_Q_CLI:-}" in /*) ;; *) echo "error: Q-managed relaunch requires an absolute FM_Q_CLI" >&2; exit 1 ;; esac
+    [ -x "$FM_Q_CLI" ] || { echo "error: Q-managed relaunch requires an executable FM_Q_CLI" >&2; exit 1; }
+    case "${FM_Q_DATA_DIR:-}" in /*) ;; *) echo "error: Q-managed relaunch requires an absolute FM_Q_DATA_DIR" >&2; exit 1 ;; esac
+    FM_Q_DELEGATION_ENABLED=1
+    export FM_Q_DELEGATION_ENABLED
+  elif [ "$Q_MANAGED" = 1 ]; then
+    echo "error: Q-managed caller cannot relaunch a task without durable Q identity" >&2
+    exit 1
+  fi
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
   YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
   RELAUNCH_WT=$(fm_meta_get "$RELAUNCH_META" worktree)
@@ -2640,6 +2676,9 @@ fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   fm_q_guard_authorize_child "$ID" "$KIND" "$HARNESS" "$MODEL" "$EFFORT" || exit $?
 fi
+if [ "$RELAUNCH" -eq 1 ]; then
+  fm_q_guard_authorize_relaunch || exit $?
+fi
 
 W="fm-$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -3859,7 +3898,7 @@ if [ "$KIND" = secondmate ]; then
   # injected carrier and this on/off snapshot are guaranteed to agree.
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
 fi
-if [ "$Q_MANAGED" = 1 ] && [ "$RELAUNCH" -eq 0 ]; then
+if [ "$Q_MANAGED" = 1 ]; then
   LAUNCH="FM_Q_MANAGED=1 FM_Q_ROOT_TASK_ID=$(shell_quote "$FM_Q_ROOT_TASK_ID") FM_Q_EXECUTION_ID=$(shell_quote "$FM_Q_EXECUTION_ID") FM_Q_PARENT_EXECUTION_ID=$(shell_quote "${FM_Q_PARENT_EXECUTION_ID:-}") FM_Q_LEASE_ID=$(shell_quote "$FM_Q_LEASE_ID") FM_Q_PHASE=$(shell_quote "$FM_Q_PHASE") FM_Q_DEPTH=$(shell_quote "${FM_Q_DEPTH:-0}") FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1 FM_Q_DELEGATION_ENABLED=$(shell_quote "${FM_Q_DELEGATION_ENABLED:-0}") FM_Q_EXPECTED_WALL_SECONDS=$(shell_quote "${FM_Q_EXPECTED_WALL_SECONDS:-1}") FM_Q_CLI=$(shell_quote "${FM_Q_CLI:-}") FM_Q_DATA_DIR=$(shell_quote "${FM_Q_DATA_DIR:-}") $LAUNCH"
 fi
 if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then

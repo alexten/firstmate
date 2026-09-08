@@ -414,7 +414,20 @@ if [ "${FM_Q_MANAGED:-}" = 1 ]; then
       exit 1
       ;;
   esac
+  case "${FM_Q_PREAUTHORIZED:-0}:${FM_Q_DELEGATION_ENABLED:-0}" in
+    0:0|0:1|1:0|1:1) ;;
+    *) echo "error: Q-managed spawn has invalid preauthorization or delegation flags" >&2; exit 1 ;;
+  esac
+  if [ "${FM_Q_DELEGATION_ENABLED:-0}" = 1 ]; then
+    case "${FM_Q_DEPTH:-}" in ''|*[!0-9]*) echo "error: Q-managed delegation requires FM_Q_DEPTH" >&2; exit 1 ;; esac
+    case "${FM_Q_EXPECTED_WALL_SECONDS:-}" in 0|''|*[!0-9]*) echo "error: Q-managed delegation requires a positive wall allocation" >&2; exit 1 ;; esac
+    case "${FM_Q_CLI:-}" in /*) ;; *) echo "error: Q-managed delegation requires an absolute FM_Q_CLI" >&2; exit 1 ;; esac
+    [ -x "$FM_Q_CLI" ] || { echo "error: Q-managed delegation requires an executable FM_Q_CLI" >&2; exit 1; }
+    case "${FM_Q_DATA_DIR:-}" in /*) ;; *) echo "error: Q-managed delegation requires an absolute FM_Q_DATA_DIR" >&2; exit 1 ;; esac
+  fi
 fi
+# shellcheck source=bin/fm-q-guard-lib.sh
+. "$SCRIPT_DIR/fm-q-guard-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 if ! LAUNCH_ENV_ENABLED=$(fm_config_source_present "$CONFIG/launch-env-allowlist"); then
@@ -911,6 +924,9 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+FM_Q_GUARD_ACQUIRED=0
+FM_Q_GUARD_COMMITTED=0
+FM_Q_GUARD_LAUNCH_DELIVERED=0
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1051,6 +1067,11 @@ spawn_abort_cleanup() {
   if [ "$CONFIG_INHERIT_LOCK_HELD" = 1 ]; then
     CONFIG_INHERIT_LOCK_HELD=0
     fm_lock_release "$CONFIG_INHERIT_LOCK" || true
+  fi
+  if [ "$FM_Q_GUARD_ACQUIRED" = 1 ] \
+     && [ "$FM_Q_GUARD_COMMITTED" != 1 ] \
+     && [ "$FM_Q_GUARD_LAUNCH_DELIVERED" != 1 ]; then
+    fm_q_guard_release_child || true
   fi
   return "$status"
 }
@@ -2612,6 +2633,14 @@ if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
   exit 1
 fi
 
+# A Q-managed supervisor obtains the child's durable lease at the last safe
+# pre-mutation boundary, after all owner preflights and before any endpoint or
+# isolated copy is created. A preauthorized Q worker uses the lease supplied by
+# fm-api and passes through without allocating again.
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
+  fm_q_guard_authorize_child "$ID" "$KIND" "$HARNESS" "$MODEL" "$EFFORT" || exit $?
+fi
+
 W="fm-$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
   # Adopt the recorded endpoint instead of creating one. This is what keeps a
@@ -3629,6 +3658,7 @@ preserve_relaunch_meta() {
     [ -z "${FM_Q_PARENT_EXECUTION_ID:-}" ] || echo "q_parent_execution_id=$FM_Q_PARENT_EXECUTION_ID"
     echo "q_lease_id=$FM_Q_LEASE_ID"
     echo "q_phase=$FM_Q_PHASE"
+    echo "q_depth=${FM_Q_DEPTH:-0}"
     echo "q_contract_schema=$FM_Q_CONTRACT_SCHEMA"
     [ -z "${FM_Q_TRACE_ID:-}" ] || echo "q_trace_id=$FM_Q_TRACE_ID"
   fi
@@ -3829,6 +3859,9 @@ if [ "$KIND" = secondmate ]; then
   # injected carrier and this on/off snapshot are guaranteed to agree.
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
 fi
+if [ "$Q_MANAGED" = 1 ] && [ "$RELAUNCH" -eq 0 ]; then
+  LAUNCH="FM_Q_MANAGED=1 FM_Q_ROOT_TASK_ID=$(shell_quote "$FM_Q_ROOT_TASK_ID") FM_Q_EXECUTION_ID=$(shell_quote "$FM_Q_EXECUTION_ID") FM_Q_PARENT_EXECUTION_ID=$(shell_quote "${FM_Q_PARENT_EXECUTION_ID:-}") FM_Q_LEASE_ID=$(shell_quote "$FM_Q_LEASE_ID") FM_Q_PHASE=$(shell_quote "$FM_Q_PHASE") FM_Q_DEPTH=$(shell_quote "${FM_Q_DEPTH:-0}") FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1 FM_Q_DELEGATION_ENABLED=$(shell_quote "${FM_Q_DELEGATION_ENABLED:-0}") FM_Q_EXPECTED_WALL_SECONDS=$(shell_quote "${FM_Q_EXPECTED_WALL_SECONDS:-1}") FM_Q_CLI=$(shell_quote "${FM_Q_CLI:-}") FM_Q_DATA_DIR=$(shell_quote "${FM_Q_DATA_DIR:-}") $LAUNCH"
+fi
 if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then
   LAUNCH="unset TRACEPARENT; $LAUNCH"
 fi
@@ -3916,6 +3949,7 @@ if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   spawn_herdr_presentation_order_lock_release
 fi
 spawn_send_key "$T" Enter
+FM_Q_GUARD_LAUNCH_DELIVERED=1
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
     kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"
@@ -4036,6 +4070,10 @@ if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
   trap - HUP INT TERM
   echo "error: spawn of $ID was interrupted after launch delivery began; $SPAWN_PRESERVED_CLAIM" >&2
   exit "$SPAWN_DEFERRED_SIGNAL_STATUS"
+fi
+if ! fm_q_guard_commit_child "$ID"; then
+  echo "error: child $ID launched but its Q lease commit is unconfirmed; preserve the endpoint and reconcile it before retrying" >&2
+  exit 1
 fi
 fm_lock_release "$SPAWN_META_LOCK"
 SPAWN_META_LOCK_HELD=0

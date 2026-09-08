@@ -10,6 +10,7 @@ BIN="$TMP_ROOT/bin"
 HOME_ROOT="$TMP_ROOT/home"
 mkdir -p "$BIN" "$HOME_ROOT/data" "$HOME_ROOT/state"
 cp "$ROOT/bin/fm-api.sh" "$BIN/fm-api.sh"
+cp "$ROOT/bin/fm-q-guard-lib.sh" "$BIN/fm-q-guard-lib.sh"
 chmod +x "$BIN/fm-api.sh"
 
 cat >"$BIN/fm-brief.sh" <<'EOF'
@@ -59,7 +60,7 @@ invoke() {
 test_capabilities_are_one_versioned_json_object() {
   out=$(FM_HOME="$HOME_ROOT" "$BIN/fm-api.sh" capabilities) || fail "capabilities failed"
   [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] || fail "capabilities emitted multiple lines"
-  printf '%s\n' "$out" | jq -e '.schema == "fm-api-response.v1" and .result == "ok" and .postcondition_evidence.q_metadata == true' >/dev/null \
+  printf '%s\n' "$out" | jq -e '.schema == "fm-api-response.v1" and .result == "ok" and .postcondition_evidence.q_metadata == true and .postcondition_evidence.q_spawn_guard == true' >/dev/null \
     || fail "capabilities response shape is invalid"
   pass "capabilities returns one versioned JSON object"
 }
@@ -83,7 +84,7 @@ test_prepare_delegates_and_renders_contract() {
 }
 
 test_spawn_requires_metadata_postcondition() {
-  request='{"schema":"q.firstmate-request.v1","operation":"worker.spawn","idempotency_key":"spawn-1","task_id":"worker-1","repository":"/repo","mode":"local-only","yolo":"off","harness":"codex","model":"default","effort":"low","q":{"root_task_id":"task-root","execution_id":"exec-1","parent_execution_id":"","lease_id":"lease-1","phase":"implementation","trace_id":""}}'
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.spawn","idempotency_key":"spawn-1","task_id":"worker-1","repository":"/repo","mode":"local-only","yolo":"off","harness":"codex","model":"default","effort":"low","q":{"root_task_id":"task-root","execution_id":"exec-1","parent_execution_id":"","lease_id":"lease-1","phase":"implementation","trace_id":"","depth":0,"expected_wall_seconds":300,"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
   out=$(invoke worker.spawn "$request") || fail "worker.spawn failed"
   printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.task_id == "worker-1"' >/dev/null \
     || fail "spawn response lacks postcondition evidence"
@@ -127,9 +128,92 @@ test_q_spawn_validation_is_opt_in_and_precedes_mutation() {
   pass "Q validation is opt-in and refuses before task mutation"
 }
 
+test_q_guard_authorizes_propagates_and_releases() {
+  calls="$TMP_ROOT/q-guard.calls"
+  fake_q="$TMP_ROOT/fake-q"
+  cat >"$fake_q" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+operation=${2:?}
+printf '%s\n' "$operation" >>"${FM_Q_FAKE_CALLS:?}"
+case "$operation" in
+  authorize)
+    request=$(cat)
+    jq -e '.schema == "q.guard-authorize-request.v1" and .parent_execution_id == "exec-parent" and .external_task_id == "child-one" and .phase == "implementation"' >/dev/null <<<"$request"
+    if [ "${FM_Q_FAKE_RESULT:-authorized}" = denied ]; then
+      printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"denied","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":null,"external_task_id":"child-one","requested_depth":1,"lease_id":"lease-denied","lease_state":"denied","denial_reason":"workers_total_exhausted"}'
+    else
+      printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-child","external_task_id":"child-one","requested_depth":1,"lease_id":"lease-child","lease_state":"reserved","denial_reason":null}'
+    fi
+    ;;
+  release)
+    printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-child","external_task_id":"child-one","requested_depth":1,"lease_id":"lease-child","lease_state":"released","denial_reason":null}'
+    ;;
+  commit)
+    printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-child","external_task_id":"child-one","requested_depth":1,"lease_id":"lease-child","lease_state":"committed","denial_reason":null}'
+    ;;
+esac
+EOF
+  chmod +x "$fake_q"
+  (
+    # shellcheck source=bin/fm-q-guard-lib.sh
+    . "$BIN/fm-q-guard-lib.sh"
+    export FM_Q_MANAGED=1 FM_Q_DELEGATION_ENABLED=1 FM_Q_PREAUTHORIZED=0
+    export FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-parent
+    export FM_Q_EXPECTED_WALL_SECONDS=300 FM_Q_CLI="$fake_q"
+    export FM_Q_DATA_DIR="$TMP_ROOT/q-data" FM_Q_FAKE_CALLS="$calls"
+    fm_q_guard_authorize_child child-one ship codex model high || exit 1
+    [ "$FM_Q_PARENT_EXECUTION_ID" = exec-parent ] || exit 1
+    [ "$FM_Q_EXECUTION_ID" = exec-child ] || exit 1
+    [ "$FM_Q_LEASE_ID" = lease-child ] || exit 1
+    [ "$FM_Q_DEPTH" = 1 ] || exit 1
+    fm_q_guard_release_child || exit 1
+  ) || fail "Q guard did not propagate and release its authorization"
+  [ "$(tr '\n' ' ' <"$calls")" = "authorize release " ] \
+    || fail "Q guard did not use the expected authorization lifecycle"
+  pass "Q guard propagates child identity and releases an aborted launch"
+}
+
+test_q_guard_refuses_denial_and_unavailable_contract() {
+  calls="$TMP_ROOT/q-guard-denied.calls"
+  fake_q="$TMP_ROOT/fake-q-denied"
+  cp "$TMP_ROOT/fake-q" "$fake_q"
+  chmod +x "$fake_q"
+  out=$({
+    . "$BIN/fm-q-guard-lib.sh"
+    export FM_Q_DELEGATION_ENABLED=1 FM_Q_PREAUTHORIZED=0
+    export FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-parent
+    export FM_Q_EXPECTED_WALL_SECONDS=300 FM_Q_CLI="$fake_q"
+    export FM_Q_DATA_DIR="$TMP_ROOT/q-data" FM_Q_FAKE_CALLS="$calls"
+    export FM_Q_FAKE_RESULT=denied
+    fm_q_guard_authorize_child child-one ship codex model high
+  } 2>&1)
+  status=$?
+  [ "$status" -eq 3 ] || fail "Q budget denial should return status 3"
+  printf '%s\n' "$out" | grep -F 'Q_GUARD_RESULT={"schema":"q.guard-authorization.v1","result":"denied"' >/dev/null \
+    || fail "Q budget denial did not preserve the structured result"
+
+  home="$TMP_ROOT/q-contract-home"
+  mkdir -p "$home"
+  out=$(FM_HOME="$home" FM_Q_MANAGED=1 FM_Q_DELEGATION_ENABLED=1 \
+    FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-parent FM_Q_LEASE_ID=lease-parent \
+    FM_Q_PHASE=supervision FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1 FM_Q_DEPTH=0 \
+    FM_Q_EXPECTED_WALL_SECONDS=300 FM_Q_CLI=relative-q FM_Q_DATA_DIR="$TMP_ROOT/q-data" \
+    FM_SPAWN_NO_GUARD=1 "$ROOT/bin/fm-spawn.sh" child-one projects/missing \
+    --mode local-only --yolo off 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "relative Q command should be refused"
+  printf '%s\n' "$out" | grep -F 'requires an absolute FM_Q_CLI' >/dev/null \
+    || fail "Q contract refusal was not explicit"
+  [ ! -e "$home/state/child-one.meta" ] || fail "Q contract refusal mutated task state"
+  pass "Q guard refuses budget denial and an unavailable contract before mutation"
+}
+
 test_capabilities_are_one_versioned_json_object
 test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
 test_spawn_requires_metadata_postcondition
 test_snapshot_inspect_and_lifecycle_delegation
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
+test_q_guard_authorizes_propagates_and_releases
+test_q_guard_refuses_denial_and_unavailable_contract

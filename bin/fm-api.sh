@@ -77,7 +77,7 @@ case "$OPERATION" in
           facade_schemas:["fm-api-response.v1"],request_schemas:["q.firstmate-request.v1"],
           harnesses:["claude","codex","opencode","pi","pi-signed","grok","kimi","cursor","omp","muse","gemini","rovo"],
           backends:["tmux","herdr","zellij","orca","cmux"],
-          controls:["interrupt","exit","relaunch"],q_metadata:true,q_spawn_guard:false,
+          controls:["interrupt","exit","relaunch"],q_metadata:true,q_spawn_guard:true,
           delivery_modes:["local-only","direct-PR","no-mistakes"],
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
@@ -163,11 +163,23 @@ PY
     q_lease=$(jq -r '.q.lease_id // empty' "$REQUEST_FILE")
     q_phase=$(jq -r '.q.phase // empty' "$REQUEST_FILE")
     q_trace=$(jq -r '.q.trace_id // empty' "$REQUEST_FILE")
-    run_owner env FM_HOME="$FM_HOME" FM_Q_MANAGED=1 \
+    q_depth=$(jq -r '.q.depth // 0' "$REQUEST_FILE")
+    q_wall=$(jq -r '.q.expected_wall_seconds // 1' "$REQUEST_FILE")
+    q_cli=$(jq -r '.q.guard_executable // empty' "$REQUEST_FILE")
+    q_data_dir=$(jq -r '.q.data_dir // empty' "$REQUEST_FILE")
+    if [ -z "$q_cli" ] || [ -z "$q_data_dir" ]; then
+      respond refused null '"Q-managed workers require a durable guard executable and data directory"' null
+      exit 2
+    fi
+    q_delegation=1
+    run_owner env FM_HOME="$FM_HOME" FM_Q_MANAGED=1 FM_Q_PREAUTHORIZED=1 \
       FM_Q_ROOT_TASK_ID="$q_root" FM_Q_EXECUTION_ID="$q_execution" \
       FM_Q_PARENT_EXECUTION_ID="$q_parent" FM_Q_LEASE_ID="$q_lease" \
       FM_Q_PHASE="$q_phase" FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1 \
-      FM_Q_TRACE_ID="$q_trace" "$SCRIPT_DIR/fm-spawn.sh" "$task_id" "$repository" \
+      FM_Q_TRACE_ID="$q_trace" FM_Q_DEPTH="$q_depth" \
+      FM_Q_DELEGATION_ENABLED="$q_delegation" FM_Q_EXPECTED_WALL_SECONDS="$q_wall" \
+      FM_Q_CLI="$q_cli" FM_Q_DATA_DIR="$q_data_dir" \
+      "$SCRIPT_DIR/fm-spawn.sh" "$task_id" "$repository" \
       --mode "$mode" --yolo "$yolo" --harness "$harness" --model "$model" --effort "$effort" || exit $?
     meta="$FM_HOME/state/$task_id.meta"
     if [ ! -f "$meta" ] || ! grep -Fqx "q_lease_id=$q_lease" "$meta"; then

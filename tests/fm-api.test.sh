@@ -229,6 +229,7 @@ test_q_guard_authorizes_each_relaunch_transaction() {
     . "$BIN/fm-q-guard-lib.sh"
     # shellcheck disable=SC2030,SC2031
     export FM_Q_MANAGED=1 FM_Q_ROOT_TASK_ID=task-root
+    # shellcheck disable=SC2030,SC2031
     export FM_Q_EXECUTION_ID=exec-child FM_CONTROL_RELAUNCH_TX=tx-one
     # shellcheck disable=SC2030,SC2031
     export FM_Q_CLI="$fake_q" FM_Q_DATA_DIR="$TMP_ROOT/q-data"

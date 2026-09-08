@@ -92,7 +92,7 @@ case "$OPERATION" in
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
     ;;
-  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.send|worker.control|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
+  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.result|worker.send|worker.control|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
   *)
     OPERATION=${OPERATION:-unknown}
     respond refused null '"unsupported operation"' null
@@ -129,6 +129,26 @@ case "$OPERATION" in
     fi
     respond ok "$(jq -cn --argjson task "$task" '{worker:$task}')"
     ;;
+  worker.result)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    meta="$FM_HOME/state/$task_id.meta"
+    result_path="$FM_HOME/data/$task_id/q-result.json"
+    [ -f "$meta" ] || { respond refused null '"worker metadata is missing"' null; exit 3; }
+    [ -f "$result_path" ] || { respond refused null '"worker result is missing"' '"wait for a terminal worker result"'; exit 3; }
+    q_root=$(sed -n 's/^q_root_task_id=//p' "$meta")
+    q_execution=$(sed -n 's/^q_execution_id=//p' "$meta")
+    if ! jq -e --arg root "$q_root" --arg execution "$q_execution" '
+        type == "object" and .schema == "q.worker-result.v1" and
+        .root_task_id == $root and .execution_id == $execution and
+        (.outcome == "completed" or .outcome == "failed" or .outcome == "blocked") and
+        (.summary | type == "string") and (.artifacts | type == "array")
+      ' "$result_path" >/dev/null 2>&1; then
+      respond refused null '"worker result is invalid or belongs to another execution"' '"preserve and repair the typed result"'
+      exit 3
+    fi
+    result=$(jq -c . "$result_path")
+    respond ok "$(jq -cn --arg path "$result_path" --argjson result "$result" '{result:$result,path:$path}')"
+    ;;
   worker.prepare)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
     repo_name=$(jq -r '.repository_name // empty' "$REQUEST_FILE")
@@ -152,6 +172,10 @@ with open(brief_path, encoding="utf-8") as stream:
     brief = stream.read()
 brief = brief.replace("{TASK}", request["captain_intent"])
 brief = brief.replace("{FIRSTMATE_SPEC}", request["execution_spec"])
+brief += "\n## Machine-readable result\n\n"
+brief += "Before reporting a terminal status, atomically write strict JSON to `"
+brief += request["result_path"] + "` matching this contract:\n\n```json\n"
+brief += json.dumps(request["result_contract"], indent=2) + "\n```\n"
 temporary = brief_path + ".q-tmp"
 with open(temporary, "w", encoding="utf-8") as stream:
     stream.write(brief)

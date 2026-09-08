@@ -90,12 +90,27 @@ test_invalid_request_refuses_as_json() {
 }
 
 test_prepare_delegates_and_renders_contract() {
-  request='{"schema":"q.firstmate-request.v1","operation":"worker.prepare","idempotency_key":"prepare-1","task_id":"worker-1","repository_name":"repo","kind":"ship","mode":"local-only","captain_intent":"Fix it.","execution_spec":"Keep scope bounded."}'
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.prepare","idempotency_key":"prepare-1","task_id":"worker-1","repository_name":"repo","kind":"ship","mode":"local-only","captain_intent":"Fix it.","execution_spec":"Keep scope bounded.","result_path":"'"$HOME_ROOT"'/data/worker-1/q-result.json","result_contract":{"schema":"q.worker-result.v1","root_task_id":"task-root","execution_id":"exec-worker","outcome":"completed|failed|blocked","summary":"string","artifacts":[],"investigation_report":null}}'
   out=$(invoke worker.prepare "$request") || fail "worker.prepare failed"
   printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null || fail "prepare response failed"
   grep -Fqx 'Fix it.' "$HOME_ROOT/data/worker-1/brief.md" || fail "captain intent was not rendered"
   grep -Fqx 'Keep scope bounded.' "$HOME_ROOT/data/worker-1/brief.md" || fail "execution spec was not rendered"
+  grep -F 'q.worker-result.v1' "$HOME_ROOT/data/worker-1/brief.md" >/dev/null \
+    || fail "typed worker result contract was not rendered"
   pass "worker.prepare delegates and renders the Q contract"
+}
+
+test_worker_result_validates_durable_identity() {
+  mkdir -p "$HOME_ROOT/data/worker-1" "$HOME_ROOT/state"
+  printf '%s\n' 'q_root_task_id=task-root' 'q_execution_id=exec-worker' \
+    >"$HOME_ROOT/state/worker-1.meta"
+  printf '%s\n' '{"schema":"q.worker-result.v1","root_task_id":"task-root","execution_id":"exec-worker","outcome":"completed","summary":"done","artifacts":[],"investigation_report":null}' \
+    >"$HOME_ROOT/data/worker-1/q-result.json"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.result","idempotency_key":"result-1","task_id":"worker-1"}'
+  out=$(invoke worker.result "$request") || fail "worker.result failed"
+  printf '%s\n' "$out" | jq -e '.postcondition_evidence.result.outcome == "completed"' >/dev/null \
+    || fail "worker result evidence is invalid"
+  pass "worker result validates durable Q identity"
 }
 
 test_spawn_requires_metadata_postcondition() {
@@ -299,6 +314,7 @@ test_delivery_delegates_to_confirming_merge_owner() {
 test_capabilities_are_one_versioned_json_object
 test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
+test_worker_result_validates_durable_identity
 test_spawn_requires_metadata_postcondition
 test_snapshot_inspect_and_lifecycle_delegation
 test_q_spawn_validation_is_opt_in_and_precedes_mutation

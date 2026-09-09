@@ -3008,7 +3008,26 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
     echo "The report is the work product. Have the crewmate write it, or use --force after explicit discard approval." >&2
     exit 1
   fi
-  if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+  Q_ROOT_SCOUT_COMPLETE=0
+  if [ "${FM_Q_ROOT_CLEANUP:-0}" = 1 ]; then
+    Q_ROOT_EXECUTION=$(fm_meta_get "$META" q_execution_id)
+    Q_ROOT_PARENT=$(fm_meta_get "$META" q_parent_execution_id)
+    Q_ROOT_PHASE=$(fm_meta_get "$META" q_phase)
+    Q_ROOT_RESULT="$DATA/$ID/q-result.json"
+    if [ -n "$Q_ROOT_EXECUTION" ] && [ -z "$Q_ROOT_PARENT" ] \
+       && [ "$Q_ROOT_PHASE" = investigation ] \
+       && jq -e --arg execution "$Q_ROOT_EXECUTION" '
+         .schema == "q.worker-result.v2" and .execution_id == $execution and
+         .outcome == "completed"
+       ' "$Q_ROOT_RESULT" >/dev/null 2>&1; then
+      Q_ROOT_SCOUT_COMPLETE=1
+    else
+      echo "REFUSED: Q root scout cleanup lacks a matching completed typed result." >&2
+      exit 1
+    fi
+  fi
+  if [ "$Q_ROOT_SCOUT_COMPLETE" != 1 ] \
+     && ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
       FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-captain-hold.sh" verify "$ID" >/dev/null; then
     echo "REFUSED: scout task $ID has not passed the captain-call completion gate." >&2
     echo "Inventory its report and any visual review through bin/fm-captain-hold.sh before teardown." >&2

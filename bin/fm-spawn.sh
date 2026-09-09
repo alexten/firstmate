@@ -399,7 +399,7 @@ if [ "${FM_Q_MANAGED:-}" = 1 ]; then
     exit 1
   fi
   case "$FM_Q_PHASE" in
-    investigation|implementation|supervision|validation) ;;
+    inspect|investigation|implementation|supervision|validation) ;;
     *) echo "error: Q-managed spawn has invalid FM_Q_PHASE" >&2; exit 1 ;;
   esac
   case "${FM_Q_PARENT_EXECUTION_ID:-}" in
@@ -1525,10 +1525,15 @@ launch_template() {
     # policy in force regardless of which settings scopes end up loaded.
     claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '\''{"feedbackDrafts":"off","attribution":{"commit":"","pr":"","sessionUrl":false}}'\'' __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
-      if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      if [ "$Q_MANAGED" = 1 ]; then
+        # Q workers and supervisors are autonomous one-shot processes that
+        # publish durable typed outcomes. The noninteractive surface avoids a
+        # workspace-trust prompt in each disposable worktree and supervisor home.
+        printf '%s' 'codex exec --skip-git-repo-check __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      elif [ "$kind" = secondmate ]; then
+        printf '%s' 'codex __CODEXTRUST____MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __CODEXTRUST____MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
@@ -2675,6 +2680,10 @@ fi
 # fm-api and passes through without allocating again.
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   fm_q_guard_authorize_child "$ID" "$KIND" "$HARNESS" "$MODEL" "$EFFORT" || exit $?
+  fm_q_guard_append_child_result_contract "$ID" || {
+    echo "error: Q child result contract could not be added before launch" >&2
+    exit 1
+  }
 fi
 if [ "$RELAUNCH" -eq 1 ]; then
   fm_q_guard_authorize_relaunch || exit $?
@@ -3836,8 +3845,14 @@ sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 sq_worktree=$(shell_quote "$WT")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
+CODEXTRUST=
+if [ "$HARNESS" = codex ]; then
+  codex_project_key=$(jq -Rrn --arg path "$PROJ_ABS" '$path | @json') || exit 1
+  CODEXTRUST="-c $(shell_quote "projects.$codex_project_key.trust_level=\"trusted\"") "
+fi
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
+LAUNCH=${LAUNCH//__CODEXTRUST__/$CODEXTRUST}
 if [ "$HARNESS" = rovo ]; then
   ROVOCONFIGOVERRIDE=$(rovo_config_override_flag "$EFFORT" "$DATA" "$STATE" "$ID") || {
     echo "error: could not resolve this task's home paths for rovo's allowedExternalPaths grant" >&2

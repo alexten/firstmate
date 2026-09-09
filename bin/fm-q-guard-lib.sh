@@ -58,7 +58,11 @@ fm_q_guard_authorize_child() {  # <task-id> <kind> <harness> <model> <effort>
       type == "object" and .schema == "q.guard-authorization.v1" and
       (.result == "authorized" or .result == "denied") and
       (.lease_id | type == "string" and length > 0) and
-      (.requested_depth | type == "number")
+      (.requested_depth | type == "number") and
+      (if .result == "authorized" then
+         .result_contract.schema == "q.worker-result.v2" and
+         (.result_contract.observed_repository | type == "string")
+       else true end)
     ' >/dev/null 2>&1 <<<"$response"; then
     echo "error: Q child authorization returned an incompatible response" >&2
     return 1
@@ -77,7 +81,41 @@ fm_q_guard_authorize_child() {  # <task-id> <kind> <harness> <model> <effort>
   FM_Q_DEPTH=$(jq -r .requested_depth <<<"$response")
   export FM_Q_DEPTH
   export FM_Q_PHASE=$phase
+  FM_Q_RESULT_CONTRACT=$(jq -c .result_contract <<<"$response")
+  export FM_Q_RESULT_CONTRACT
   FM_Q_GUARD_ACQUIRED=1
+}
+
+fm_q_guard_append_child_result_contract() {  # <task-id>
+  local child_id=$1 brief result_path
+  [ "${FM_Q_GUARD_ACQUIRED:-0}" = 1 ] || return 0
+  [ -n "${FM_Q_RESULT_CONTRACT:-}" ] || return 1
+  brief="$DATA/$child_id/brief.md"
+  result_path="$DATA/$child_id/q-result.json"
+  [ -f "$brief" ] || return 1
+  python3 - "$brief" "$result_path" "$FM_Q_RESULT_CONTRACT" <<'PY'
+import json
+import os
+import sys
+
+brief_path, result_path, serialized = sys.argv[1:]
+contract = json.loads(serialized)
+with open(brief_path, encoding="utf-8") as stream:
+    brief = stream.read()
+brief += "\n## Quartermaster delegated-child completion override\n\n"
+brief += "This is a Q-authorized child. q-result.json is the sole completion handoff. "
+brief += "Do not use captain-hold, tasks-axi, delivery, teardown, or a Firstmate "
+brief += "completion gate. Their absence is not a blocker. After all intended commits, "
+brief += "run `git rev-parse HEAD` immediately before serialization and record that full "
+brief += "revision; record `pwd -P` separately as worktree and copy observed_repository "
+brief += "exactly from the contract. Generate with a JSON serializer, validate with "
+brief += "`jq -e .`, then atomically publish strict JSON to `" + result_path + "`:\n\n"
+brief += "```json\n" + json.dumps(contract, indent=2) + "\n```\n"
+temporary = brief_path + ".q-result-tmp"
+with open(temporary, "w", encoding="utf-8") as stream:
+    stream.write(brief)
+os.replace(temporary, brief_path)
+PY
 }
 
 fm_q_guard_commit_child() {  # <external-task-id>

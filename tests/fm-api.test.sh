@@ -32,12 +32,23 @@ fi
 home=${FM_HOME:?}
 id=$1
 mkdir -p "$home/state"
+worktree="$home/worktree-$id"
+mkdir -p "$worktree"
+if [ ! -d "$worktree/.git" ]; then
+  git -C "$worktree" init -q
+  git -C "$worktree" config user.name Test
+  git -C "$worktree" config user.email test@example.invalid
+  printf 'fixture\n' >"$worktree/README.md"
+  git -C "$worktree" add README.md
+  git -C "$worktree" commit -qm initial
+fi
 {
   printf 'q_root_task_id=%s\n' "${FM_Q_ROOT_TASK_ID:?}"
   printf 'q_execution_id=%s\n' "${FM_Q_EXECUTION_ID:?}"
   printf 'q_lease_id=%s\n' "${FM_Q_LEASE_ID:?}"
   printf 'q_phase=%s\n' "${FM_Q_PHASE:?}"
   printf 'q_contract_schema=%s\n' "${FM_Q_CONTRACT_SCHEMA:?}"
+  printf 'worktree=%s\n' "$worktree"
   if printf '%s\n' "$*" | grep -F -- '--secondmate' >/dev/null; then
     printf 'home=%s\n' "$(cat "$home/state/q-supervisor-home")"
   fi
@@ -50,8 +61,9 @@ set -eu
 controller=${FM_HOME:?}
 id=$1
 home=$2
-mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+mkdir -p "$home/state" "$home/data/$id" "$home/config" "$home/projects"
 printf '%s\n' "$id" >"$home/.fm-secondmate-home"
+printf '%s\n' "${FM_SECONDMATE_CHARTER:-}" >"$home/data/$id/charter.md"
 printf '%s\n' "$home" >"$controller/state/q-supervisor-home"
 printf 'home=%s\n' "$home"
 EOF
@@ -66,6 +78,9 @@ for owner in fm-send.sh fm-control.sh fm-teardown.sh fm-merge-local.sh fm-pr-mer
 #!/usr/bin/env bash
 if [ "${0##*/}" = fm-control.sh ] && [ -n "${FM_Q_RELAUNCH_IDEMPOTENCY_KEY:-}" ]; then
   printf '%s\n' "$FM_Q_RELAUNCH_IDEMPOTENCY_KEY" >"$FM_HOME/state/relaunch-operation-key"
+fi
+if [ "${0##*/}" = fm-teardown.sh ]; then
+  printf '%s\n' "${FM_Q_ROOT_CLEANUP:-0}" >"$FM_HOME/state/root-cleanup-flag"
 fi
 printf 'owner diagnostic\n' >&2
 exit 0
@@ -106,6 +121,10 @@ test_prepare_delegates_and_renders_contract() {
     || fail "typed worker result contract was not rendered"
   grep -F 'jq -e .' "$HOME_ROOT/data/worker-1/brief.md" >/dev/null \
     || fail "typed worker result did not require parser validation"
+  grep -F 'Do not call captain-hold, tasks-axi' "$HOME_ROOT/data/worker-1/brief.md" >/dev/null \
+    || fail "Q completion did not override the ordinary Firstmate completion gate"
+  grep -F 'immediately before serializing the result' "$HOME_ROOT/data/worker-1/brief.md" >/dev/null \
+    || fail "Q completion did not require a post-commit observed revision"
   pass "worker.prepare delegates and renders the Q contract"
 }
 
@@ -122,13 +141,71 @@ test_worker_result_validates_durable_identity() {
   pass "worker result validates durable Q identity"
 }
 
+test_worker_result_accepts_v2_typed_evidence() {
+  mkdir -p "$HOME_ROOT/data/worker-1" "$HOME_ROOT/state" "$HOME_ROOT/observed"
+  printf '%s\n' 'q_root_task_id=task-root' 'q_execution_id=exec-worker' \
+    >"$HOME_ROOT/state/worker-1.meta"
+  printf '%s\n' '{"schema":"q.worker-result.v2","root_task_id":"task-root","execution_id":"exec-worker","outcome":"completed","summary":"README is 8 bytes.","artifacts":[],"evidence":[{"kind":"command","summary":"measured","command":{"argv":["wc","-c","README.md"],"exit_status":0,"output":"8 README.md","working_directory":"/tmp/work"}}],"observed_repository":"/repo","observed_revision":"abc123","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-09T00:00:00Z"}' \
+    >"$HOME_ROOT/data/worker-1/q-result.json"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.result","idempotency_key":"result-v2","task_id":"worker-1"}'
+  out=$(invoke worker.result "$request") || fail "worker.result v2 failed"
+  printf '%s\n' "$out" | jq -e '.postcondition_evidence.result.schema == "q.worker-result.v2" and (.postcondition_evidence.result.evidence | length) == 1' >/dev/null \
+    || fail "worker result v2 evidence is invalid"
+  printf '%s\n' '{"schema":"q.worker-result.v2","root_task_id":"task-root","execution_id":"exec-worker","outcome":"completed","summary":"bad evidence","artifacts":[],"evidence":[{"kind":"command","summary":"not typed","command":"pytest -q"}],"observed_repository":"/repo","observed_revision":"abc123","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-09T00:00:00Z"}' \
+    >"$HOME_ROOT/data/worker-1/q-result.json"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.result","idempotency_key":"result-v2-invalid-evidence","task_id":"worker-1"}'
+  out=$(invoke worker.result "$request")
+  [ "$?" -eq 3 ] || fail "worker result accepted a string command as typed evidence"
+  printf '%s\n' "$out" | jq -e '.result == "refused"' >/dev/null \
+    || fail "invalid v2 evidence did not return a typed refusal"
+  printf '%s\n' '{"schema":"q.worker-result.v2","root_task_id":"task-root","execution_id":"exec-worker","outcome":"completed","summary":"bad report","artifacts":[],"investigation_report":"not typed","evidence":[],"observed_repository":"/repo","observed_revision":"abc123","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-09T00:00:00Z"}' \
+    >"$HOME_ROOT/data/worker-1/q-result.json"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.result","idempotency_key":"result-v2-invalid-report","task_id":"worker-1"}'
+  out=$(invoke worker.result "$request")
+  [ "$?" -eq 3 ] || fail "worker result accepted an untyped investigation report"
+  printf '%s\n' "$out" | jq -e '.result == "refused"' >/dev/null \
+    || fail "invalid investigation report did not return a typed refusal"
+  pass "worker result accepts v2 typed evidence"
+}
+
 test_spawn_requires_metadata_postcondition() {
   request='{"schema":"q.firstmate-request.v1","operation":"worker.spawn","idempotency_key":"spawn-1","task_id":"worker-1","repository":"/repo","mode":"local-only","yolo":"off","harness":"codex","model":"default","effort":"low","q":{"root_task_id":"task-root","execution_id":"exec-1","parent_execution_id":"","lease_id":"lease-1","phase":"implementation","trace_id":"","depth":0,"expected_wall_seconds":300,"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
   out=$(invoke worker.spawn "$request") || fail "worker.spawn failed"
-  printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.task_id == "worker-1"' >/dev/null \
+  printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.task_id == "worker-1" and (.postcondition_evidence.worktree | type == "string") and (.postcondition_evidence.observed_revision | length) == 40' >/dev/null \
     || fail "spawn response lacks postcondition evidence"
   grep -Fqx 'q_lease_id=lease-1' "$HOME_ROOT/state/worker-1.meta" || fail "lease metadata is absent"
   pass "worker.spawn verifies additive Q metadata"
+}
+
+test_supervised_worker_spawn_commits_pre_authorized_lease() {
+  fake_q="$TMP_ROOT/fake-q-spawn-commit"
+  calls="$TMP_ROOT/q-spawn-commit.calls"
+  cat >"$fake_q" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+[ "$1" = guard ] && [ "$2" = commit ]
+printf '%s\n' "$*" >"${FM_Q_FAKE_CALLS:?}"
+printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-supervisor","execution_id":"exec-child","external_task_id":"worker-child","requested_depth":1,"lease_id":"lease-child","lease_state":"committed","denial_reason":null}'
+EOF
+  chmod +x "$fake_q"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.spawn","idempotency_key":"spawn-child-1","task_id":"worker-child","repository":"/repo","mode":"local-only","yolo":"off","harness":"codex","model":"default","effort":"low","q":{"root_task_id":"task-root","execution_id":"exec-child","parent_execution_id":"exec-supervisor","lease_id":"lease-child","phase":"implementation","trace_id":"","depth":1,"expected_wall_seconds":300,"guard_executable":"'"$fake_q"'","data_dir":"/tmp/q-data"}}'
+  out=$(printf '%s\n' "$request" | FM_HOME="$HOME_ROOT" FM_Q_FAKE_CALLS="$calls" \
+    "$BIN/fm-api.sh" worker.spawn) || fail "supervised worker.spawn failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null \
+    || fail "supervised worker.spawn response failed"
+  grep -F -- 'guard commit --data-dir /tmp/q-data' "$calls" >/dev/null \
+    || fail "supervised worker.spawn did not commit its pre-authorized lease"
+  grep -F -- '--external-task-id worker-child' "$calls" >/dev/null \
+    || fail "supervised worker.spawn commit did not bind the external identity"
+  pass "supervised worker.spawn commits its pre-authorized child lease"
+}
+
+test_report_only_spawn_accepts_inspect_phase() {
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.spawn","idempotency_key":"spawn-inspect-1","task_id":"worker-inspect","repository":"/repo","kind":"scout","mode":"local-only","yolo":"off","harness":"codex","model":"default","effort":"low","q":{"root_task_id":"task-root","execution_id":"exec-inspect","parent_execution_id":"","lease_id":"lease-inspect","phase":"inspect","trace_id":"","depth":0,"expected_wall_seconds":300,"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
+  out=$(invoke worker.spawn "$request") || fail "report-only worker.spawn failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.task_id == "worker-inspect"' >/dev/null \
+    || fail "inspect phase did not return spawn evidence"
+  pass "report-only worker.spawn accepts the inspect phase"
 }
 
 test_owner_failure_returns_one_error_response() {
@@ -162,9 +239,87 @@ test_snapshot_inspect_and_lifecycle_delegation() {
   grep -F 'owner diagnostic' "$TMP_ROOT/send.err" >/dev/null || fail "owner diagnostics were not forwarded to stderr"
   out=$(invoke worker.control "$base,"'"operation":"worker.control","task_id":"worker-1","verb":"exit"}') || fail "control failed"
   printf '%s\n' "$out" | jq -e '.postcondition_evidence.confirmed == true' >/dev/null || fail "control was not confirmed"
+  printf '%s\n' 'kind=ship' >"$HOME_ROOT/state/worker-1.meta"
   out=$(invoke worker.cleanup "$base,"'"operation":"worker.cleanup","task_id":"worker-1"}') || fail "cleanup failed"
   printf '%s\n' "$out" | jq -e '.postcondition_evidence.cleanup == "confirmed"' >/dev/null || fail "cleanup was not confirmed"
   pass "snapshot and worker lifecycle calls delegate through typed responses"
+}
+
+test_q_worker_cleanup_settles_failed_child_lease() {
+  fake_q="$TMP_ROOT/fake-q-cleanup"
+  calls="$TMP_ROOT/q-cleanup.calls"
+  cat >"$fake_q" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+[ "$1" = guard ] && [ "$2" = fail ]
+printf '%s\n' "$*" >"${FM_Q_FAKE_CALLS:?}"
+printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-child","external_task_id":"failed-child","requested_depth":1,"lease_id":"lease-child","lease_state":"released","denial_reason":null}'
+EOF
+  chmod +x "$fake_q"
+  printf '%s\n' 'q_execution_id=exec-child' 'q_parent_execution_id=exec-parent' \
+    'q_lease_id=lease-child' \
+    >"$HOME_ROOT/state/failed-child.meta"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.cleanup","idempotency_key":"cleanup-q-child","task_id":"failed-child"}'
+  out=$(printf '%s\n' "$request" | FM_HOME="$HOME_ROOT" FM_Q_CLI="$fake_q" \
+    FM_Q_DATA_DIR="$TMP_ROOT/q-data" FM_Q_FAKE_CALLS="$calls" \
+    "$BIN/fm-api.sh" worker.cleanup) || fail "Q child cleanup failed"
+  printf '%s\n' "$out" | jq -e \
+    '.result == "ok" and .postcondition_evidence.cleanup == "confirmed" and .postcondition_evidence.q_settled == true' \
+    >/dev/null || fail "Q child cleanup did not confirm lease settlement"
+  grep -F -- 'guard fail --data-dir' "$calls" >/dev/null \
+    || fail "Q child cleanup did not use the failed-child settlement boundary"
+  grep -F -- '--external-task-id failed-child' "$calls" >/dev/null \
+    || fail "Q child cleanup did not bind settlement to the external identity"
+  pass "Q worker cleanup settles a stopped failed child lease"
+}
+
+test_q_worker_cleanup_settles_completed_investigation_child() {
+  fake_q="$TMP_ROOT/fake-q-complete"
+  calls="$TMP_ROOT/q-complete.calls"
+  cat >"$fake_q" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+[ "$1" = guard ] && [ "$2" = complete ]
+printf '%s\n' "$*" >"${FM_Q_FAKE_CALLS:?}"
+printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-scout","external_task_id":"completed-scout","requested_depth":1,"lease_id":"lease-scout","lease_state":"released","denial_reason":null}'
+EOF
+  chmod +x "$fake_q"
+  mkdir -p "$HOME_ROOT/data/completed-scout"
+  printf '%s\n' 'kind=scout' 'q_execution_id=exec-scout' \
+    'q_parent_execution_id=exec-parent' 'q_lease_id=lease-scout' \
+    'q_phase=investigation' >"$HOME_ROOT/state/completed-scout.meta"
+  printf '%s\n' '{"schema":"q.worker-result.v2","root_task_id":"task-root","execution_id":"exec-scout","outcome":"completed"}' \
+    >"$HOME_ROOT/data/completed-scout/q-result.json"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.cleanup","idempotency_key":"cleanup-q-scout","task_id":"completed-scout"}'
+  out=$(printf '%s\n' "$request" | FM_HOME="$HOME_ROOT" FM_Q_CLI="$fake_q" \
+    FM_Q_DATA_DIR="$TMP_ROOT/q-data" FM_Q_FAKE_CALLS="$calls" \
+    "$BIN/fm-api.sh" worker.cleanup) || fail "completed Q scout cleanup failed"
+  printf '%s\n' "$out" | jq -e \
+    '.result == "ok" and .postcondition_evidence.q_settled == true' >/dev/null \
+    || fail "completed Q scout cleanup did not confirm lease settlement"
+  grep -F -- 'guard complete --data-dir' "$calls" >/dev/null \
+    || fail "completed Q scout cleanup did not use the completion boundary"
+  pass "Q worker cleanup settles a completed investigation child"
+}
+
+test_q_root_investigation_cleanup_leaves_settlement_to_q() {
+  local home request out
+  home="$TMP_ROOT/q-root-cleanup-home"
+  mkdir -p "$home/state" "$home/data/root-scout"
+  printf '%s\n' 'q_root_task_id=task-root' 'q_execution_id=exec-root-scout' \
+    'q_lease_id=lease-root-scout' 'q_phase=investigation' \
+    >"$home/state/root-scout.meta"
+  printf '%s\n' '{"schema":"q.worker-result.v2","root_task_id":"task-root","execution_id":"exec-root-scout","outcome":"completed"}' \
+    >"$home/data/root-scout/q-result.json"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.cleanup","idempotency_key":"cleanup-q-root-scout","task_id":"root-scout"}'
+  out=$(printf '%s\n' "$request" | FM_HOME="$home" \
+    "$BIN/fm-api.sh" worker.cleanup) || fail "root Q scout cleanup failed"
+  printf '%s\n' "$out" | jq -e \
+    '.result == "ok" and .postcondition_evidence.cleanup == "confirmed" and .postcondition_evidence.q_settled == false' >/dev/null \
+    || fail "root Q scout cleanup did not preserve Q-owned settlement"
+  grep -Fqx '1' "$home/state/root-cleanup-flag" \
+    || fail "root Q scout cleanup did not authorize the typed-result teardown path"
+  pass "Q root investigation cleanup leaves lease settlement to Q"
 }
 
 test_inspect_reports_typed_worker_absence() {
@@ -226,7 +381,7 @@ case "$operation" in
     if [ "${FM_Q_FAKE_RESULT:-authorized}" = denied ]; then
       printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"denied","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":null,"external_task_id":"child-one","requested_depth":1,"lease_id":"lease-denied","lease_state":"denied","denial_reason":"workers_total_exhausted"}'
     else
-      printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-child","external_task_id":"child-one","requested_depth":1,"lease_id":"lease-child","lease_state":"reserved","denial_reason":null}'
+      printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-child","external_task_id":"child-one","requested_depth":1,"lease_id":"lease-child","lease_state":"reserved","denial_reason":null,"result_contract":{"schema":"q.worker-result.v2","root_task_id":"task-root","execution_id":"exec-child","outcome":"completed | failed | blocked","summary":"string","artifacts":[],"investigation_report":null,"usage":[],"evidence":[],"observed_repository":"/repo","observed_revision":"git rev-parse HEAD after the final commit","worktree":"pwd -P","branch":"git branch --show-current, or null when detached","completed_at":"RFC3339 timestamp"}}'
     fi
     ;;
   release)
@@ -254,11 +409,18 @@ EOF
     export FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-parent
     export FM_Q_EXPECTED_WALL_SECONDS=300 FM_Q_CLI="$fake_q"
     export FM_Q_DATA_DIR="$TMP_ROOT/q-data" FM_Q_FAKE_CALLS="$calls"
+    DATA="$TMP_ROOT/q-child-data"
+    mkdir -p "$DATA/child-one"
+    printf '%s\n' 'child brief' >"$DATA/child-one/brief.md"
     fm_q_guard_authorize_child child-one ship codex model high || exit 1
     [ "$FM_Q_PARENT_EXECUTION_ID" = exec-parent ] || exit 1
     [ "$FM_Q_EXECUTION_ID" = exec-child ] || exit 1
     [ "$FM_Q_LEASE_ID" = lease-child ] || exit 1
     [ "$FM_Q_DEPTH" = 1 ] || exit 1
+    [ "$(jq -r .schema <<<"$FM_Q_RESULT_CONTRACT")" = q.worker-result.v2 ] || exit 1
+    fm_q_guard_append_child_result_contract child-one || exit 1
+    grep -F 'Quartermaster delegated-child completion override' \
+      "$DATA/child-one/brief.md" >/dev/null || exit 1
     fm_q_guard_release_child || exit 1
   ) || fail "Q guard did not propagate and release its authorization"
   [ "$(tr '\n' ' ' <"$calls")" = "authorize release " ] \
@@ -365,6 +527,13 @@ test_supervisor_operations_use_secondmate_owners_and_structured_events() {
     || fail "supervisor prepare evidence is invalid"
   [ "$(cat "$supervisor_home/.fm-secondmate-home")" = supervisor-1 ] \
     || fail "supervisor home owner did not provision the home"
+  grep -F 'data.result' "$supervisor_home/data/supervisor-1/charter.md" >/dev/null 2>&1 \
+    || grep -R -F 'data.result' "$supervisor_home" >/dev/null 2>&1 \
+    || fail "supervisor charter did not require the typed terminal child result"
+  grep -R -F 'their absence is not a blocker' "$supervisor_home" >/dev/null 2>&1 \
+    || fail "supervisor charter did not exclude unrelated Firstmate dependencies"
+  grep -R -F 'the field is named event, never state' "$supervisor_home" >/dev/null 2>&1 \
+    || fail "supervisor charter did not make the event discriminator explicit"
 
   request='{"schema":"q.firstmate-request.v1","operation":"supervisor.start","idempotency_key":"supervisor-start-1","task_id":"supervisor-1","repository":"/repo","supervisor_home":"'"$supervisor_home"'","harness":"codex","model":"default","effort":"high","q":{"root_task_id":"task-root","execution_id":"exec-supervisor","lease_id":"lease-supervisor","expected_wall_seconds":600,"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
   out=$(invoke supervisor.start "$request") || fail "supervisor.start failed"
@@ -379,6 +548,15 @@ test_supervisor_operations_use_secondmate_owners_and_structured_events() {
   out=$(invoke supervisor.inspect "$request") || fail "supervisor.inspect failed"
   printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.schema == "q.supervisor-snapshot.v1" and .postcondition_evidence.live == true and .postcondition_evidence.events[0].event == "accepted"' >/dev/null \
     || fail "supervisor inspect did not return versioned structured events"
+
+  printf '%s\n' '{"schema":"q.supervisor-event.v1","sequence":1,"state":"accepted","root_task_id":"task-root","message":"wrong discriminator","data":{}}' \
+    >"$supervisor_home/state/q-supervisor-events.jsonl"
+  out=$(invoke supervisor.inspect "$request")
+  [ "$?" -eq 1 ] || fail "invalid supervisor event discriminator was accepted"
+  printf '%s\n' "$out" | jq -e '.result == "error" and .error == "supervisor event stream is invalid"' >/dev/null \
+    || fail "invalid supervisor event stream did not return a typed error"
+  printf '%s\n' '{"schema":"q.supervisor-event.v1","sequence":1,"event":"accepted","root_task_id":"task-root","message":"accepted","data":{}}' \
+    >"$supervisor_home/state/q-supervisor-events.jsonl"
 
   base='{"schema":"q.firstmate-request.v1","idempotency_key":"supervisor-operation-1"'
   out=$(invoke supervisor.send "$base,"'"operation":"supervisor.send","task_id":"supervisor-1","message":"continue"}') || fail "supervisor.send failed"
@@ -401,9 +579,15 @@ test_capabilities_are_one_versioned_json_object
 test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
 test_worker_result_validates_durable_identity
+test_worker_result_accepts_v2_typed_evidence
 test_spawn_requires_metadata_postcondition
+test_supervised_worker_spawn_commits_pre_authorized_lease
+test_report_only_spawn_accepts_inspect_phase
 test_owner_failure_returns_one_error_response
 test_snapshot_inspect_and_lifecycle_delegation
+test_q_worker_cleanup_settles_failed_child_lease
+test_q_worker_cleanup_settles_completed_investigation_child
+test_q_root_investigation_cleanup_leaves_settlement_to_q
 test_inspect_reports_typed_worker_absence
 test_worker_relaunch_delegates_with_q_transport
 test_q_spawn_validation_is_opt_in_and_precedes_mutation

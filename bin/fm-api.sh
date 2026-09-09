@@ -141,10 +141,43 @@ case "$OPERATION" in
     q_root=$(sed -n 's/^q_root_task_id=//p' "$meta")
     q_execution=$(sed -n 's/^q_execution_id=//p' "$meta")
     if ! jq -e --arg root "$q_root" --arg execution "$q_execution" '
-        type == "object" and .schema == "q.worker-result.v1" and
+        type == "object" and
+        (.schema == "q.worker-result.v1" or .schema == "q.worker-result.v2") and
         .root_task_id == $root and .execution_id == $execution and
         (.outcome == "completed" or .outcome == "failed" or .outcome == "blocked") and
-        (.summary | type == "string") and (.artifacts | type == "array")
+        (.summary | type == "string") and (.artifacts | type == "array") and
+        ((.investigation_report == null) or
+         ((.investigation_report | type) == "object" and
+          .investigation_report.schema == "q.investigation-report.v1" and
+          (.investigation_report.summary | type) == "string" and
+          (.investigation_report.material_facts | type) == "array" and
+          all(.investigation_report.material_facts[];
+            (.kind | type) == "string" and (.summary | type) == "string" and
+            ((.fact_id == null) or ((.fact_id | type) == "string"))) and
+          (.investigation_report.remaining_unknowns | type) == "array" and
+          all(.investigation_report.remaining_unknowns[]; type == "string") and
+          (.investigation_report.recommended_implementation | type) == "array" and
+          all(.investigation_report.recommended_implementation[]; type == "string") and
+          (.investigation_report.authority_expansion_required | type) == "boolean")) and
+        (if .schema == "q.worker-result.v2" then
+          (.evidence | type == "array") and
+          all(.evidence[];
+            (.kind == "request" or .kind == "repository" or
+             .kind == "command" or .kind == "test" or
+             .kind == "analysis" or .kind == "artifact") and
+            (.summary | type == "string") and
+            ((.command == null) or
+             ((.command | type == "object") and
+              (.command.argv | type == "array") and
+              (.command.exit_status | type == "number") and
+              (.command.output | type == "string") and
+              (.command.working_directory | type == "string")))) and
+          (.observed_repository | type == "string") and
+          (.observed_revision | type == "string") and
+          (.worktree | type == "string") and
+          ((.branch == null) or (.branch | type == "string")) and
+          (.completed_at | type == "string")
+        else true end)
       ' "$result_path" >/dev/null 2>&1; then
       respond refused null '"worker result is invalid or belongs to another execution"' '"preserve and repair the typed result"'
       exit 3
@@ -175,6 +208,20 @@ with open(brief_path, encoding="utf-8") as stream:
     brief = stream.read()
 brief = brief.replace("{TASK}", request["captain_intent"])
 brief = brief.replace("{FIRSTMATE_SPEC}", request["execution_spec"])
+brief += "\n## Quartermaster completion override\n\n"
+brief += "This is a Q-managed worker. The machine-readable q-result.json below is the "
+brief += "sole completion handoff. Do not call captain-hold, tasks-axi, delivery, teardown, "
+brief += "or a Firstmate completion gate. Do not mark the work blocked merely because those "
+brief += "tools are absent. Set outcome from the assigned task itself, atomically publish the "
+brief += "typed result, and then stop.\n"
+brief += "Do not call no-mistakes; Quartermaster owns any separate validation.\n"
+brief += "Copy observed_repository exactly from the result contract (it is the primary "
+brief += "repository), and record the isolated checkout separately in worktree. Never replace "
+brief += "observed_repository with pwd. Copy the exact starting revision unless the worker "
+brief += "created a commit, and obtain worktree from pwd -P. After every intended commit is "
+brief += "complete and immediately before serializing the result, run `git rev-parse HEAD` in "
+brief += "that worktree and copy its full output into observed_revision. Do not reuse a revision "
+brief += "captured before the final commit.\n"
 brief += "\n## Machine-readable result\n\n"
 brief += "Before reporting a terminal status, generate the result with a JSON serializer, "
 brief += "validate it with `jq -e .`, and atomically write strict JSON to `"
@@ -195,6 +242,8 @@ PY
     harness=$(jq -r '.harness // empty' "$REQUEST_FILE")
     model=$(jq -r '.model // empty' "$REQUEST_FILE")
     effort=$(jq -r '.effort // empty' "$REQUEST_FILE")
+    kind=$(jq -r '.kind // "ship"' "$REQUEST_FILE")
+    case "$kind" in ship|scout) ;; *) respond refused null '"worker kind must be ship or scout"' null; exit 2 ;; esac
     q_root=$(jq -r '.q.root_task_id // empty' "$REQUEST_FILE")
     q_execution=$(jq -r '.q.execution_id // empty' "$REQUEST_FILE")
     q_parent=$(jq -r '.q.parent_execution_id // empty' "$REQUEST_FILE")
@@ -210,6 +259,14 @@ PY
       exit 2
     fi
     q_delegation=1
+    spawn_kind_args=()
+    mode_args=(--mode "$mode")
+    yolo_args=(--yolo "$yolo")
+    if [ "$kind" = scout ]; then
+      spawn_kind_args+=(--scout)
+      mode_args=()
+      yolo_args=()
+    fi
     run_owner env FM_HOME="$FM_HOME" FM_Q_MANAGED=1 FM_Q_PREAUTHORIZED=1 \
       FM_Q_ROOT_TASK_ID="$q_root" FM_Q_EXECUTION_ID="$q_execution" \
       FM_Q_PARENT_EXECUTION_ID="$q_parent" FM_Q_LEASE_ID="$q_lease" \
@@ -218,13 +275,41 @@ PY
       FM_Q_DELEGATION_ENABLED="$q_delegation" FM_Q_EXPECTED_WALL_SECONDS="$q_wall" \
       FM_Q_CLI="$q_cli" FM_Q_DATA_DIR="$q_data_dir" \
       "$SCRIPT_DIR/fm-spawn.sh" "$task_id" "$repository" \
-      --mode "$mode" --yolo "$yolo" --harness "$harness" --model "$model" --effort "$effort" || exit $?
+      "${spawn_kind_args[@]}" "${mode_args[@]}" "${yolo_args[@]}" --harness "$harness" --model "$model" --effort "$effort" || exit $?
     meta="$FM_HOME/state/$task_id.meta"
     if [ ! -f "$meta" ] || ! grep -Fqx "q_lease_id=$q_lease" "$meta"; then
       respond partial null '"worker launched but Q metadata postcondition is missing"' '"inspect the worker before retrying"'
       exit 4
     fi
-    respond ok "$(jq -cn --arg task_id "$task_id" --arg meta "$meta" '{task_id:$task_id,metadata_path:$meta}')"
+    if [ -n "$q_parent" ]; then
+      if ! q_response=$("$q_cli" guard commit --data-dir "$q_data_dir" \
+          --lease-id "$q_lease" --execution-id "$q_execution" \
+          --external-task-id "$task_id"); then
+        respond partial null '"supervised child launched but its Q lease commit is unconfirmed"' '"preserve the endpoint and reconcile the child launch"'
+        exit 4
+      fi
+      if ! jq -e --arg execution "$q_execution" '
+          .schema == "q.guard-authorization.v1" and
+          .execution_id == $execution and .lease_state == "committed"
+        ' >/dev/null 2>&1 <<<"$q_response"; then
+        respond partial null '"supervised child launched but Q returned incompatible commit evidence"' '"preserve the endpoint and reconcile the child launch"'
+        exit 4
+      fi
+    fi
+    worktree=$(sed -n 's/^worktree=//p' "$meta")
+    [ -n "$worktree" ] && [ -d "$worktree" ] || {
+      respond partial null '"worker launched but its recorded worktree is unavailable"' '"inspect the worker before retrying"'
+      exit 4
+    }
+    observed_revision=$(git -C "$worktree" rev-parse HEAD 2>/dev/null) || {
+      respond partial null '"worker launched but its recorded revision is unreadable"' '"inspect the worker before retrying"'
+      exit 4
+    }
+    branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    respond ok "$(jq -cn --arg task_id "$task_id" --arg meta "$meta" \
+      --arg worktree "$worktree" --arg branch "$branch" --arg revision "$observed_revision" \
+      '{task_id:$task_id,metadata_path:$meta,worktree:$worktree,
+        branch:(if $branch == "" then null else $branch end),observed_revision:$revision}')"
     ;;
   worker.send)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
@@ -256,8 +341,65 @@ PY
     ;;
   worker.cleanup)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
-    run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-teardown.sh" "$task_id" || exit $?
-    respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,cleanup:"confirmed"}')"
+    meta="$FM_HOME/state/$task_id.meta"
+    q_execution=
+    q_parent=
+    q_lease=
+    q_phase=
+    q_outcome=
+    q_root_cleanup=0
+    if [ -f "$meta" ]; then
+      q_execution=$(sed -n 's/^q_execution_id=//p' "$meta")
+      q_parent=$(sed -n 's/^q_parent_execution_id=//p' "$meta")
+      q_lease=$(sed -n 's/^q_lease_id=//p' "$meta")
+      q_phase=$(sed -n 's/^q_phase=//p' "$meta")
+      result_file="$FM_HOME/data/$task_id/q-result.json"
+      if [ -f "$result_file" ]; then
+        q_outcome=$(jq -r --arg execution "$q_execution" '
+          if .schema == "q.worker-result.v2" and
+             .execution_id == $execution and .outcome == "completed"
+          then .outcome else empty end
+        ' "$result_file" 2>/dev/null || true)
+      fi
+    fi
+    if { [ -n "$q_execution" ] && [ -z "$q_lease" ]; } \
+       || { [ -z "$q_execution" ] && [ -n "$q_lease" ]; }; then
+      respond refused null '"Q-managed worker cleanup metadata is incomplete"' null
+      exit 3
+    fi
+    if [ -n "$q_execution" ] && [ -z "$q_parent" ] \
+       && [ "$q_phase" = investigation ] && [ "$q_outcome" = completed ]; then
+      q_root_cleanup=1
+    fi
+    run_owner env FM_HOME="$FM_HOME" FM_Q_ROOT_CLEANUP="$q_root_cleanup" \
+      "$SCRIPT_DIR/fm-teardown.sh" "$task_id" || exit $?
+    q_settled=false
+    if [ -n "$q_execution" ] && [ -n "$q_parent" ]; then
+      q_cli=${FM_Q_CLI:-}
+      q_data_dir=${FM_Q_DATA_DIR:-}
+      case "$q_cli" in /*) ;; *) respond partial null '"worker cleanup succeeded but the Q command is unavailable"' '"reconcile the stopped child lease"'; exit 4 ;; esac
+      case "$q_data_dir" in /*) ;; *) respond partial null '"worker cleanup succeeded but the Q data directory is unavailable"' '"reconcile the stopped child lease"'; exit 4 ;; esac
+      q_settlement=fail
+      if [ "$q_phase" = investigation ] && [ "$q_outcome" = completed ]; then
+        q_settlement=complete
+      fi
+      if ! q_response=$("$q_cli" guard "$q_settlement" --data-dir "$q_data_dir" \
+          --lease-id "$q_lease" --execution-id "$q_execution" \
+          --external-task-id "$task_id"); then
+        respond partial null '"worker cleanup succeeded but Q did not settle the stopped child"' '"reconcile the stopped child lease"'
+        exit 4
+      fi
+      if ! jq -e --arg execution "$q_execution" '
+          .schema == "q.guard-authorization.v1" and
+          .execution_id == $execution and .lease_state == "released"
+        ' >/dev/null 2>&1 <<<"$q_response"; then
+        respond partial null '"worker cleanup succeeded but Q returned incompatible settlement evidence"' '"reconcile the stopped child lease"'
+        exit 4
+      fi
+      q_settled=true
+    fi
+    respond ok "$(jq -cn --arg task_id "$task_id" --argjson settled "$q_settled" \
+      '{task_id:$task_id,cleanup:"confirmed",q_settled:$settled}')"
     ;;
   supervisor.prepare)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
@@ -278,7 +420,7 @@ PY
       exit 0
     fi
     charter=$(printf '%s\n\n%s\n\n%s\n' "$captain_intent" "$execution_spec" \
-      "Write only q.supervisor-event.v1 JSON objects, one per line with consecutive sequence numbers, to state/q-supervisor-events.jsonl. Every event must carry root_task_id=$root_task_id. Use accepted, child_proposed, child_lease_denied, decision_required, blocked, validation_ready, delivery_ready, failed, or completed. Q alone authorizes child leases, budgets, validation, and delivery.")
+      "This is a Q-managed local-only supervision run. Q is the lifecycle owner and its spawn guard is already wired transparently into Firstmate. Do not require or install gh-axi, chrome-devtools-axi, lavish-axi, tasks-axi, quota-axi, no-mistakes, GitHub authentication, delivery tooling, or production credentials; they are outside this charter and their absence is not a blocker. Use ordinary Firstmate brief/spawn operations for only the children justified by the task, and let the wired Q guard accept or deny each lease. Never promote or relaunch an investigation child to perform implementation; a child's authorized phase is immutable. After a nonselected investigation child publishes a valid completed q.worker-result.v2, or after a child fails and safe cleanup succeeds, invoke bin/fm-api.sh worker.cleanup with a strict q.firstmate-request.v1 request instead of calling fm-teardown.sh directly; this is how Q is told that the stopped child no longer consumes concurrency. Never clean up selected completed implementation work before Q ingests its typed result. Do not request a user decision merely to bypass ordinary Firstmate completion conventions. Write only q.supervisor-event.v1 JSON objects, one per line with consecutive sequence numbers, to state/q-supervisor-events.jsonl. The exact shape is {\"schema\":\"q.supervisor-event.v1\",\"sequence\":1,\"event\":\"accepted\",\"root_task_id\":\"$root_task_id\",\"message\":\"concise summary\",\"data\":{}}; the field is named event, never state. Every event must carry root_task_id=$root_task_id. Use accepted, child_proposed, child_lease_denied, decision_required, blocked, validation_ready, delivery_ready, failed, or completed. A validation_ready, delivery_ready, or completed event must put the selected child's complete q.worker-result.v2 object in data.result and its durable Firstmate id in data.external_task_id. Obtain that result through the facade; never reconstruct worktree or revision identity. Q alone authorizes child leases, budgets, validation, and delivery.")
     run_owner env FM_HOME="$FM_HOME" FM_SECONDMATE_CHARTER="$charter" \
       FM_SECONDMATE_SCOPE="Quartermaster root $root_task_id only." \
       "$SCRIPT_DIR/fm-home-seed.sh" "$task_id" "$supervisor_home" "$project_name" || exit $?
@@ -331,7 +473,14 @@ PY
     if [ -s "$events_file" ]; then
       if ! events=$(jq -sc --arg root "$root_task_id" '
           if all(.[]; .schema == "q.supervisor-event.v1" and
-            .root_task_id == $root and (.sequence | type == "number")) then .
+            .root_task_id == $root and
+            (.sequence | type == "number") and .sequence > 0 and
+            (.event == "accepted" or .event == "child_proposed" or
+             .event == "child_lease_denied" or .event == "decision_required" or
+             .event == "blocked" or .event == "validation_ready" or
+             .event == "delivery_ready" or .event == "failed" or
+             .event == "completed") and
+            (.message | type == "string") and (.data | type == "object")) then .
           else error("invalid supervisor event stream") end
         ' "$events_file" 2>/dev/null); then
         respond error null '"supervisor event stream is invalid"' '"preserve the stream and reconcile it"'
@@ -350,7 +499,44 @@ PY
     ;;
   supervisor.stop)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
-    run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-control.sh" "$task_id" exit || exit $?
+    run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json || exit $?
+    task=$(jq -c --arg id "$task_id" '[.tasks[] | select(.id == $id)][0] // null' "$OWNER_OUT")
+    if [ "$task" = null ] || jq -e '
+        (.endpoint.exists // false) != true or
+        (.endpoint.agent_alive // "not_checked") == "dead" or
+        (.current_state.state == "done" or .current_state.state == "failed")
+      ' >/dev/null 2>&1 <<<"$task"; then
+      respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true,already_stopped:true}')"
+      exit 0
+    fi
+    control_out=$(mktemp "${TMPDIR:-/tmp}/fm-api-control-out.XXXXXX")
+    control_err=$(mktemp "${TMPDIR:-/tmp}/fm-api-control-err.XXXXXX")
+    if env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-control.sh" "$task_id" exit \
+        >"$control_out" 2>"$control_err"; then
+      control_status=0
+    else
+      control_status=$?
+      cat "$control_err" >&2
+      if env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json \
+          >"$control_out" 2>>"$control_err"; then
+        task=$(jq -c --arg id "$task_id" '[.tasks[] | select(.id == $id)][0] // null' "$control_out")
+        if [ "$task" = null ] || jq -e '
+            (.endpoint.exists // false) != true or
+            (.endpoint.agent_alive // "not_checked") == "dead" or
+            (.current_state.state == "done" or .current_state.state == "failed")
+          ' >/dev/null 2>&1 <<<"$task"; then
+          rm -f "$control_out" "$control_err"
+          respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true,already_stopped:true}')"
+          exit 0
+        fi
+      fi
+      owner_error=$(jq -Rs . <"$control_err")
+      rm -f "$control_out" "$control_err"
+      respond error null "$owner_error" '"inspect the supervisor endpoint and retry after reconciliation"'
+      exit "$control_status"
+    fi
+    cat "$control_err" >&2
+    rm -f "$control_out" "$control_err"
     respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true}')"
     ;;
   delivery.execute)

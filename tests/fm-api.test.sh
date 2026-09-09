@@ -25,6 +25,10 @@ EOF
 cat >"$BIN/fm-spawn.sh" <<'EOF'
 #!/usr/bin/env bash
 set -eu
+if [ "${FM_TEST_SPAWN_FAIL:-0}" = 1 ]; then
+  printf '%s\n' 'deliberate spawn-owner failure' >&2
+  exit 19
+fi
 home=${FM_HOME:?}
 id=$1
 mkdir -p "$home/state"
@@ -123,6 +127,24 @@ test_spawn_requires_metadata_postcondition() {
     || fail "spawn response lacks postcondition evidence"
   grep -Fqx 'q_lease_id=lease-1' "$HOME_ROOT/state/worker-1.meta" || fail "lease metadata is absent"
   pass "worker.spawn verifies additive Q metadata"
+}
+
+test_owner_failure_returns_one_error_response() {
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.spawn","idempotency_key":"spawn-failure-1","task_id":"worker-failure","repository":"/repo","mode":"local-only","yolo":"off","harness":"codex","model":"default","effort":"low","q":{"root_task_id":"task-root","execution_id":"exec-failure","parent_execution_id":"","lease_id":"lease-failure","phase":"implementation","trace_id":"","depth":0,"expected_wall_seconds":300,"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
+  out=$(printf '%s\n' "$request" | FM_HOME="$HOME_ROOT" FM_TEST_SPAWN_FAIL=1 \
+    "$BIN/fm-api.sh" worker.spawn 2>"$TMP_ROOT/spawn-failure.err")
+  status=$?
+  [ "$status" -eq 19 ] || fail "facade did not preserve the spawn owner's failure status"
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "failed owner emitted more than one facade response"
+  printf '%s\n' "$out" | jq -e \
+    '.schema == "fm-api-response.v1" and .result == "error" and (.error | contains("deliberate spawn-owner failure"))' \
+    >/dev/null || fail "failed owner response is not one structured error"
+  grep -F 'deliberate spawn-owner failure' "$TMP_ROOT/spawn-failure.err" >/dev/null \
+    || fail "failed owner diagnostics were not forwarded to stderr"
+  [ ! -e "$HOME_ROOT/state/worker-failure.meta" ] \
+    || fail "facade continued into metadata verification after owner failure"
+  pass "owner failure returns exactly one structured facade response"
 }
 
 test_snapshot_inspect_and_lifecycle_delegation() {
@@ -362,6 +384,7 @@ test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
 test_worker_result_validates_durable_identity
 test_spawn_requires_metadata_postcondition
+test_owner_failure_returns_one_error_response
 test_snapshot_inspect_and_lifecycle_delegation
 test_worker_relaunch_delegates_with_q_transport
 test_q_spawn_validation_is_opt_in_and_precedes_mutation

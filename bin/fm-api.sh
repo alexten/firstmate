@@ -59,8 +59,9 @@ run_owner() {
   if "$@" >"$OWNER_OUT" 2>"$OWNER_ERR"; then
     cat "$OWNER_ERR" >&2
     return 0
+  else
+    owner_rc=$?
   fi
-  owner_rc=$?
   cat "$OWNER_ERR" >&2
   guard_result=$(sed -n 's/^Q_GUARD_RESULT=//p' "$OWNER_ERR" | tail -n 1)
   if [ -n "$guard_result" ] && jq -e '

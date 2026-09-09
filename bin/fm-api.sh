@@ -125,7 +125,9 @@ case "$OPERATION" in
     run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json || exit $?
     task=$(jq -c --arg id "$task_id" '[.tasks[] | select(.id == $id)][0] // null' "$OWNER_OUT")
     if [ "$task" = null ]; then
-      respond refused null '"worker is not present in the current snapshot"' '"reconcile the recorded external identity"'
+      absent=$(jq -cn --arg task_id "$task_id" \
+        '{schema:"fm-worker-observation.v1",task_id:$task_id,present:false,snapshot_schema:"fm-fleet-snapshot.v1"}')
+      respond refused "$absent" '"worker is not present in the current snapshot"' '"reconcile the recorded external identity"'
       exit 3
     fi
     respond ok "$(jq -cn --argjson task "$task" '{worker:$task}')"
@@ -174,7 +176,8 @@ with open(brief_path, encoding="utf-8") as stream:
 brief = brief.replace("{TASK}", request["captain_intent"])
 brief = brief.replace("{FIRSTMATE_SPEC}", request["execution_spec"])
 brief += "\n## Machine-readable result\n\n"
-brief += "Before reporting a terminal status, atomically write strict JSON to `"
+brief += "Before reporting a terminal status, generate the result with a JSON serializer, "
+brief += "validate it with `jq -e .`, and atomically write strict JSON to `"
 brief += request["result_path"] + "` matching this contract:\n\n```json\n"
 brief += json.dumps(request["result_contract"], indent=2) + "\n```\n"
 temporary = brief_path + ".q-tmp"

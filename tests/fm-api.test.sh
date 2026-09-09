@@ -104,6 +104,8 @@ test_prepare_delegates_and_renders_contract() {
   grep -Fqx 'Keep scope bounded.' "$HOME_ROOT/data/worker-1/brief.md" || fail "execution spec was not rendered"
   grep -F 'q.worker-result.v1' "$HOME_ROOT/data/worker-1/brief.md" >/dev/null \
     || fail "typed worker result contract was not rendered"
+  grep -F 'jq -e .' "$HOME_ROOT/data/worker-1/brief.md" >/dev/null \
+    || fail "typed worker result did not require parser validation"
   pass "worker.prepare delegates and renders the Q contract"
 }
 
@@ -163,6 +165,22 @@ test_snapshot_inspect_and_lifecycle_delegation() {
   out=$(invoke worker.cleanup "$base,"'"operation":"worker.cleanup","task_id":"worker-1"}') || fail "cleanup failed"
   printf '%s\n' "$out" | jq -e '.postcondition_evidence.cleanup == "confirmed"' >/dev/null || fail "cleanup was not confirmed"
   pass "snapshot and worker lifecycle calls delegate through typed responses"
+}
+
+test_inspect_reports_typed_worker_absence() {
+  base='{"schema":"q.firstmate-request.v1","idempotency_key":"inspect-absent-1"'
+  out=$(invoke worker.inspect "$base,"'"operation":"worker.inspect","task_id":"missing-worker"}')
+  status=$?
+  [ "$status" -eq 3 ] || fail "missing worker inspection did not preserve refusal status"
+  printf '%s\n' "$out" | jq -e \
+    '.schema == "fm-api-response.v1" and .result == "refused" and
+     .postcondition_evidence == {
+       schema:"fm-worker-observation.v1",
+       task_id:"missing-worker",
+       present:false,
+       snapshot_schema:"fm-fleet-snapshot.v1"
+     }' >/dev/null || fail "missing worker inspection did not return typed absence evidence"
+  pass "worker.inspect reports typed snapshot absence"
 }
 
 test_worker_relaunch_delegates_with_q_transport() {
@@ -386,6 +404,7 @@ test_worker_result_validates_durable_identity
 test_spawn_requires_metadata_postcondition
 test_owner_failure_returns_one_error_response
 test_snapshot_inspect_and_lifecycle_delegation
+test_inspect_reports_typed_worker_absence
 test_worker_relaunch_delegates_with_q_transport
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
 test_q_guard_authorizes_propagates_and_releases

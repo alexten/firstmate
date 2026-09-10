@@ -13,6 +13,22 @@ cp "$ROOT/bin/fm-api.sh" "$BIN/fm-api.sh"
 cp "$ROOT/bin/fm-q-guard-lib.sh" "$BIN/fm-q-guard-lib.sh"
 chmod +x "$BIN/fm-api.sh"
 
+cat >"$BIN/fm-backend.sh" <<'EOF'
+fm_backend_validate_task_endpoint() {
+  [ -f "$1" ] || return 1
+  [ "$2" = worker-capture ] || return 1
+  FM_BACKEND_VALIDATED_BACKEND=tmux
+  FM_BACKEND_VALIDATED_TARGET=fixture:fm-worker-capture
+}
+
+fm_backend_capture_ansi() {
+  [ "$1" = tmux ]
+  [ "$2" = fixture:fm-worker-capture ]
+  [ "$3" -le 500 ]
+  printf '\033[32mstyled worker output\033[0m\n'
+}
+EOF
+
 cat >"$BIN/fm-brief.sh" <<'EOF'
 #!/usr/bin/env bash
 set -eu
@@ -338,6 +354,29 @@ test_inspect_reports_typed_worker_absence() {
   pass "worker.inspect reports typed snapshot absence"
 }
 
+test_worker_capture_resolves_recorded_endpoint_and_preserves_ansi() {
+  printf '%s\n' 'window=fixture:fm-worker-capture' 'worktree=/tmp/work' 'project=repo' \
+    >"$HOME_ROOT/state/worker-capture.meta"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.capture","idempotency_key":"capture-1","task_id":"worker-capture","lines":120}'
+  out=$(invoke worker.capture "$request") || fail "worker.capture failed"
+  printf '%s\n' "$out" | jq -e '
+    .result == "ok" and
+    .postcondition_evidence.schema == "fm-terminal-frame.v1" and
+    .postcondition_evidence.task_id == "worker-capture" and
+    .postcondition_evidence.backend == "tmux" and
+    .postcondition_evidence.styled == true and
+    .postcondition_evidence.max_lines == 120 and
+    (.postcondition_evidence.content | contains("\u001b[32mstyled worker output"))
+  ' >/dev/null || fail "worker capture did not return bounded styled evidence"
+
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.capture","idempotency_key":"capture-too-large","task_id":"worker-capture","lines":501}'
+  out=$(invoke worker.capture "$request")
+  [ "$?" -eq 2 ] || fail "worker.capture accepted an unbounded line count"
+  printf '%s\n' "$out" | jq -e '.result == "refused"' >/dev/null \
+    || fail "unbounded worker capture did not return a typed refusal"
+  pass "worker.capture resolves recorded endpoints and preserves ANSI"
+}
+
 test_worker_relaunch_delegates_with_q_transport() {
   request='{"schema":"q.firstmate-request.v1","operation":"worker.relaunch","idempotency_key":"repair-1","task_id":"worker-1","note":"Repair failed validation.","q":{"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
   out=$(invoke worker.relaunch "$request") || fail "worker.relaunch failed"
@@ -589,6 +628,7 @@ test_q_worker_cleanup_settles_failed_child_lease
 test_q_worker_cleanup_settles_completed_investigation_child
 test_q_root_investigation_cleanup_leaves_settlement_to_q
 test_inspect_reports_typed_worker_absence
+test_worker_capture_resolves_recorded_endpoint_and_preserves_ansi
 test_worker_relaunch_delegates_with_q_transport
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
 test_q_guard_authorizes_propagates_and_releases

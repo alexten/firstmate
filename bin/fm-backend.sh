@@ -711,6 +711,19 @@ fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
   esac
 }
 
+# fm_backend_capture_ansi: bounded styled capture where the backend has a
+# verified read-only implementation.  Callers must degrade when unsupported.
+fm_backend_capture_ansi() {  # <backend> <target> <lines> [expected-label]
+  local backend=$1
+  shift
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_capture_ansi "$@" ;;
+    herdr) fm_backend_herdr_capture_ansi "$@" ;;
+    *) echo "error: no styled capture implementation for backend '$backend'" >&2; return 1 ;;
+  esac
+}
+
 # fm_backend_send_key: one backend-supported named special key.
 fm_backend_send_key() {  # <backend> <target> <key> [expected-label]
   local backend=$1

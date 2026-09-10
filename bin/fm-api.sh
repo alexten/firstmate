@@ -2,8 +2,9 @@
 # Versioned machine-readable facade for Quartermaster.
 # Usage: fm-api.sh capabilities
 #        fm-api.sh <operation> < request.json
-# Supported operations are fleet.snapshot, worker lifecycle, supervisor
-# prepare/start/send/inspect/stop, and approved delivery execution.
+# Supported operations are fleet.snapshot, worker lifecycle and read-only
+# terminal capture, supervisor prepare/start/send/inspect/stop, and approved
+# delivery execution.
 # Requests use schema q.firstmate-request.v1 and must name the invoked operation.
 # Successful stdout contains exactly one fm-api-response.v1 JSON object.
 # Owner diagnostics are forwarded to stderr and never mixed into the response.
@@ -93,7 +94,7 @@ case "$OPERATION" in
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
     ;;
-  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.result|worker.send|worker.control|worker.relaunch|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
+  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.capture|worker.result|worker.send|worker.control|worker.relaunch|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
   *)
     OPERATION=${OPERATION:-unknown}
     respond refused null '"unsupported operation"' null
@@ -131,6 +132,33 @@ case "$OPERATION" in
       exit 3
     fi
     respond ok "$(jq -cn --argjson task "$task" '{worker:$task}')"
+    ;;
+  worker.capture)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    if ! jq -e '(.lines // 200) | type == "number" and . == floor and . >= 1 and . <= 500' \
+        "$REQUEST_FILE" >/dev/null; then
+      respond refused null '"capture lines must be an integer from 1 through 500"' null
+      exit 2
+    fi
+    lines=$(jq -r '.lines // 200' "$REQUEST_FILE")
+    meta="$FM_HOME/state/$task_id.meta"
+    # shellcheck source=bin/fm-backend.sh
+    . "$SCRIPT_DIR/fm-backend.sh"
+    if ! fm_backend_validate_task_endpoint "$meta" "$task_id"; then
+      respond refused null '"recorded worker endpoint is missing or invalid"' '"retain the control plane and inspect Firstmate diagnostics"'
+      exit 3
+    fi
+    backend=$FM_BACKEND_VALIDATED_BACKEND
+    target=$FM_BACKEND_VALIDATED_TARGET
+    run_owner fm_backend_capture_ansi "$backend" "$target" "$lines" "fm-$task_id" || exit $?
+    frame_bytes=$(wc -c <"$OWNER_OUT" | tr -d ' ')
+    truncated=false
+    [ "$frame_bytes" -le 262144 ] || truncated=true
+    frame=$(head -c 262144 "$OWNER_OUT" | jq -Rs .)
+    respond ok "$(jq -cn --arg task_id "$task_id" --arg backend "$backend" \
+      --argjson lines "$lines" --argjson frame "$frame" --argjson truncated "$truncated" \
+      '{schema:"fm-terminal-frame.v1",task_id:$task_id,backend:$backend,
+        styled:true,max_lines:$lines,content:$frame,truncated:$truncated}')"
     ;;
   worker.result)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")

@@ -398,12 +398,15 @@ if [ "${FM_Q_MANAGED:-}" = 1 ]; then
         ;;
     esac
   done
-  if [ "${FM_Q_CONTRACT_SCHEMA:-}" != q.worker-contract.v1 ]; then
-    echo "error: Q-managed spawn requires FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1" >&2
-    exit 1
-  fi
+  case "${FM_Q_CONTRACT_SCHEMA:-}" in
+    q.worker-contract.v1|q.worker-contract.v2) ;;
+    *)
+      echo "error: Q-managed spawn requires a supported FM_Q_CONTRACT_SCHEMA" >&2
+      exit 1
+      ;;
+  esac
   case "$FM_Q_PHASE" in
-    inspect|investigation|implementation|supervision|validation) ;;
+    inspect|investigation|implementation|report|supervision|validation) ;;
     *) echo "error: Q-managed spawn has invalid FM_Q_PHASE" >&2; exit 1 ;;
   esac
   case "${FM_Q_PARENT_EXECUTION_ID:-}" in
@@ -3963,7 +3966,7 @@ if [ "$KIND" = secondmate ]; then
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
 fi
 if [ "$Q_MANAGED" = 1 ]; then
-  LAUNCH="FM_Q_MANAGED=1 FM_Q_ROOT_TASK_ID=$(shell_quote "$FM_Q_ROOT_TASK_ID") FM_Q_EXECUTION_ID=$(shell_quote "$FM_Q_EXECUTION_ID") FM_Q_PARENT_EXECUTION_ID=$(shell_quote "${FM_Q_PARENT_EXECUTION_ID:-}") FM_Q_LEASE_ID=$(shell_quote "$FM_Q_LEASE_ID") FM_Q_PHASE=$(shell_quote "$FM_Q_PHASE") FM_Q_DEPTH=$(shell_quote "${FM_Q_DEPTH:-0}") FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1 FM_Q_DELEGATION_ENABLED=$(shell_quote "${FM_Q_DELEGATION_ENABLED:-0}") FM_Q_EXPECTED_WALL_SECONDS=$(shell_quote "${FM_Q_EXPECTED_WALL_SECONDS:-1}") FM_Q_CLI=$(shell_quote "${FM_Q_CLI:-}") FM_Q_DATA_DIR=$(shell_quote "${FM_Q_DATA_DIR:-}") $LAUNCH"
+  LAUNCH="FM_Q_MANAGED=1 FM_Q_ROOT_TASK_ID=$(shell_quote "$FM_Q_ROOT_TASK_ID") FM_Q_EXECUTION_ID=$(shell_quote "$FM_Q_EXECUTION_ID") FM_Q_PARENT_EXECUTION_ID=$(shell_quote "${FM_Q_PARENT_EXECUTION_ID:-}") FM_Q_LEASE_ID=$(shell_quote "$FM_Q_LEASE_ID") FM_Q_PHASE=$(shell_quote "$FM_Q_PHASE") FM_Q_DEPTH=$(shell_quote "${FM_Q_DEPTH:-0}") FM_Q_CONTRACT_SCHEMA=$(shell_quote "$FM_Q_CONTRACT_SCHEMA") FM_Q_DELEGATION_ENABLED=$(shell_quote "${FM_Q_DELEGATION_ENABLED:-0}") FM_Q_EXPECTED_WALL_SECONDS=$(shell_quote "${FM_Q_EXPECTED_WALL_SECONDS:-1}") FM_Q_CLI=$(shell_quote "${FM_Q_CLI:-}") FM_Q_DATA_DIR=$(shell_quote "${FM_Q_DATA_DIR:-}") $LAUNCH"
 fi
 if [ -z "$SPAWN_TRACEPARENT" ] && [ "$RELAUNCH" -eq 1 ]; then
   LAUNCH="unset TRACEPARENT; $LAUNCH"

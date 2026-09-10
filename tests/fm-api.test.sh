@@ -113,7 +113,14 @@ invoke() {
 test_capabilities_are_one_versioned_json_object() {
   out=$(FM_HOME="$HOME_ROOT" "$BIN/fm-api.sh" capabilities) || fail "capabilities failed"
   [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] || fail "capabilities emitted multiple lines"
-  printf '%s\n' "$out" | jq -e '.schema == "fm-api-response.v1" and .result == "ok" and .postcondition_evidence.q_metadata == true and .postcondition_evidence.q_spawn_guard == true' >/dev/null \
+  printf '%s\n' "$out" | jq -e '
+    .schema == "fm-api-response.v1" and .result == "ok" and
+    .postcondition_evidence.q_metadata == true and
+    .postcondition_evidence.q_spawn_guard == true and
+    (.postcondition_evidence.request_schemas | index("q.firstmate-request.v2")) != null and
+    .postcondition_evidence.retirement_receipts == true and
+    .postcondition_evidence.artifact_publication == true
+  ' >/dev/null \
     || fail "capabilities response shape is invalid"
   pass "capabilities returns one versioned JSON object"
 }
@@ -142,6 +149,58 @@ test_prepare_delegates_and_renders_contract() {
   grep -F 'immediately before serializing the result' "$HOME_ROOT/data/worker-1/brief.md" >/dev/null \
     || fail "Q completion did not require a post-commit observed revision"
   pass "worker.prepare delegates and renders the Q contract"
+}
+
+test_v2_report_worker_contract_prepares_and_spawns() {
+  request=$(jq -cn --arg result_path "$HOME_ROOT/data/worker-v2/q-result.json" \
+    --arg publication "$HOME_ROOT/publications/worker-v2" \
+    '{schema:"q.firstmate-request.v2",operation:"worker.prepare",
+      idempotency_key:"prepare-v2",task_id:"worker-v2",repository_name:"repo",
+      kind:"scout",mode:"local-only",captain_intent:"Evaluate readiness.",
+      execution_spec:"Publish the typed report.",result_path:$result_path,
+      worker_contract:{schema:"q.worker-contract.v2",root_task_id:"task-root-v2",
+        execution_id:"worker-v2",phase:"report",disposition:"report_only",
+        output_manifest_id:"manifest-v2",
+        output_artifact_ids:["artifact-v2"],publication_directory:$publication},
+      result_contract:{schema:"q.worker-result.v3",root_task_id:"task-root-v2",
+        execution_id:"worker-v2",artifact_manifest_id:"manifest-v2",
+        primary_output:{kind:"report",artifact_id:"artifact-v2"}}}')
+  out=$(invoke worker.prepare "$request") || fail "v2 worker.prepare failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null \
+    || fail "v2 worker.prepare response failed"
+  grep -F 'q.worker-result.v3' "$HOME_ROOT/data/worker-v2/brief.md" >/dev/null \
+    || fail "v2 preparation did not render the v3 result contract"
+  grep -F "$HOME_ROOT/publications/worker-v2" "$HOME_ROOT/data/worker-v2/brief.md" >/dev/null \
+    || fail "v2 preparation did not permit the artifact publication directory"
+
+  request='{"schema":"q.firstmate-request.v2","operation":"worker.spawn","idempotency_key":"spawn-v2","task_id":"worker-v2","repository":"/repo","kind":"scout","mode":"local-only","yolo":"off","harness":"codex","model":"default","effort":"medium","q":{"root_task_id":"task-root-v2","execution_id":"worker-v2","parent_execution_id":"","lease_id":"lease-v2","phase":"investigation","trace_id":"","depth":0,"expected_wall_seconds":300,"guard_executable":"/bin/true","data_dir":"/tmp/q-data"}}'
+  out=$(invoke worker.spawn "$request") || fail "v2 worker.spawn failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null \
+    || fail "v2 worker.spawn response failed"
+  grep -Fqx 'q_contract_schema=q.worker-contract.v2' "$HOME_ROOT/state/worker-v2.meta" \
+    || fail "v2 worker contract identity was not retained by spawn"
+  pass "v2 report worker contract prepares and spawns additively"
+}
+
+test_v2_investigation_prepares_without_artifact_publication() {
+  request=$(jq -cn --arg result_path "$HOME_ROOT/data/worker-investigation/q-result.json" \
+    '{schema:"q.firstmate-request.v2",operation:"worker.prepare",
+      idempotency_key:"prepare-investigation",task_id:"worker-investigation",
+      repository_name:"repo",kind:"scout",mode:"local-only",
+      captain_intent:"Investigate ambiguity.",execution_spec:"Publish the typed handoff.",
+      result_path:$result_path,
+      worker_contract:{schema:"q.worker-contract.v2",root_task_id:"task-investigation",
+        execution_id:"worker-investigation",phase:"investigation",disposition:"report_only",
+        output_manifest_id:null,output_artifact_ids:[],publication_directory:null},
+      result_contract:{schema:"q.worker-result.v3",root_task_id:"task-investigation",
+        execution_id:"worker-investigation",artifact_manifest_id:null,
+        primary_output:{kind:"summary",artifact_id:null}}}')
+  out=$(invoke worker.prepare "$request") || fail "v2 investigation worker.prepare failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null \
+    || fail "v2 investigation worker.prepare response failed"
+  grep -F '"kind": "summary"' "$HOME_ROOT/data/worker-investigation/brief.md" >/dev/null \
+    || fail "v2 investigation did not render the inline handoff contract"
+  pass "v2 investigation prepares without fake artifact publication"
 }
 
 test_worker_result_validates_durable_identity() {
@@ -182,6 +241,94 @@ test_worker_result_accepts_v2_typed_evidence() {
   printf '%s\n' "$out" | jq -e '.result == "refused"' >/dev/null \
     || fail "invalid investigation report did not return a typed refusal"
   pass "worker result accepts v2 typed evidence"
+}
+
+test_worker_result_v3_and_retirement_are_typed_and_idempotent() {
+  mkdir -p "$HOME_ROOT/data/worker-retire" "$HOME_ROOT/state" "$HOME_ROOT/worktree-worker-retire"
+  printf '%s\n' 'q_root_task_id=task-root-v3' 'q_execution_id=exec-v3' \
+    'q_contract_schema=q.worker-contract.v2' \
+    "worktree=$HOME_ROOT/worktree-worker-retire" \
+    >"$HOME_ROOT/state/worker-retire.meta"
+  printf '%s\n' '{"schema":"q.worker-result.v3","root_task_id":"task-root-v3","execution_id":"exec-v3","execution_generation":1,"result_generation":1,"outcome":"completed","summary":"Readiness report completed.","artifacts":[],"investigation_report":null,"usage":[],"evidence":[],"observed_repository":"/repo","observed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-10T00:00:00Z","finality":"final","disposition":"report_only","primary_output":{"kind":"report","title":"Readiness","media_type":"text/markdown; charset=utf-8","artifact_id":"artifact-report","completeness":"complete"},"artifact_manifest_id":"manifest-report","supersedes_result_id":null,"validation_binding":null}' \
+    >"$HOME_ROOT/data/worker-retire/q-result.json"
+  request='{"schema":"q.firstmate-request.v1","operation":"worker.result","idempotency_key":"result-v3","task_id":"worker-retire"}'
+  out=$(invoke worker.result "$request") || fail "worker.result v3 failed"
+  printf '%s\n' "$out" | jq -e \
+    '.postcondition_evidence.result.schema == "q.worker-result.v3" and
+     .postcondition_evidence.result.primary_output.artifact_id == "artifact-report"' \
+    >/dev/null || fail "worker result v3 evidence is invalid"
+
+  request='{"schema":"q.firstmate-request.v2","operation":"worker.retire","idempotency_key":"retire-v3","task_id":"worker-retire"}'
+  first=$(invoke worker.retire "$request") || fail "worker.retire failed"
+  second=$(invoke worker.retire "$request") || fail "worker.retire replay failed"
+  printf '%s\n' "$first" | jq -e \
+    '.result == "ok" and
+     .postcondition_evidence.retirement_receipt.schema == "fm.retirement-receipt.v1" and
+     .postcondition_evidence.retirement_receipt.root_task_id == "task-root-v3" and
+     .postcondition_evidence.retirement_receipt.execution_generation == 1 and
+     .postcondition_evidence.retirement_receipt.mutation_owner == "none"' \
+    >/dev/null || fail "worker retirement receipt is invalid"
+  [ "$(printf '%s\n' "$first" | jq -c .postcondition_evidence)" = \
+    "$(printf '%s\n' "$second" | jq -c .postcondition_evidence)" ] \
+    || fail "worker retirement replay changed its durable receipt"
+  pass "worker result v3 and retirement are typed and idempotent"
+}
+
+test_legacy_v3_investigation_report_is_normalized_to_internal_summary() {
+  worker='worker-investigation-result'
+  mkdir -p "$HOME_ROOT/data/$worker" "$HOME_ROOT/state"
+  printf '%s\n' 'q_root_task_id=task-investigation-result' \
+    'q_execution_id=exec-investigation-result' 'q_phase=investigation' \
+    >"$HOME_ROOT/state/$worker.meta"
+  printf '%s\n' \
+    '{"schema":"q.worker-result.v3","root_task_id":"task-investigation-result","execution_id":"exec-investigation-result","execution_generation":1,"result_generation":1,"outcome":"completed","summary":"The ambiguity is resolved.","artifacts":[],"investigation_report":{"schema":"q.investigation-report.v1","summary":"The ambiguity is resolved.","material_facts":[],"remaining_unknowns":[],"recommended_implementation":["Write the final report."],"authority_expansion_required":false},"usage":[],"evidence":[],"observed_repository":"/repo","observed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-10T00:00:00Z","finality":"final","disposition":"report_only","primary_output":{"kind":"report","title":"Investigation","media_type":"text/markdown; charset=utf-8","artifact_id":null,"completeness":"complete"},"artifact_manifest_id":"manifest-unused","supersedes_result_id":null,"validation_binding":null}' \
+    >"$HOME_ROOT/data/$worker/q-result.json"
+  request='{"schema":"q.firstmate-request.v2","operation":"worker.result","idempotency_key":"result-investigation-normalize","task_id":"worker-investigation-result"}'
+  out=$(invoke worker.result "$request") || fail "legacy investigation result was refused"
+  printf '%s\n' "$out" | jq -e '
+    .postcondition_evidence.result.primary_output == {
+      kind:"summary",title:"Investigation handoff",media_type:null,
+      artifact_id:null,completeness:"complete"
+    } and .postcondition_evidence.result.artifact_manifest_id == null
+  ' >/dev/null || fail "legacy investigation result was not normalized"
+  pass "legacy v3 investigation result is normalized to an internal summary"
+}
+
+test_codex_worker_result_waits_for_and_reports_structured_usage() {
+  worker='worker-codex-usage'
+  codex_home="$TMP_ROOT/codex-home"
+  sessions="$codex_home/sessions/2023/11/14"
+  mkdir -p "$HOME_ROOT/data/$worker" "$HOME_ROOT/state" "$sessions"
+  printf '%s\n' 'q_root_task_id=task-codex-usage' 'q_execution_id=exec-codex-usage' \
+    'harness=codex' 'spawn_gen=s1700000000.12.34' \
+    "worktree=$HOME_ROOT/worktree-codex-usage" \
+    >"$HOME_ROOT/state/$worker.meta"
+  printf '%s\n' \
+    '{"schema":"q.worker-result.v3","root_task_id":"task-codex-usage","execution_id":"exec-codex-usage","execution_generation":1,"result_generation":1,"outcome":"completed","summary":"Investigation complete.","artifacts":[],"investigation_report":null,"usage":[],"evidence":[],"observed_repository":"/repo","observed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-10T00:00:00Z","finality":"final","disposition":"report_only","primary_output":{"kind":"summary","title":"Investigation handoff","media_type":null,"artifact_id":null,"completeness":"complete"},"artifact_manifest_id":null,"supersedes_result_id":null,"validation_binding":null}' \
+    >"$HOME_ROOT/data/$worker/q-result.json"
+  request='{"schema":"q.firstmate-request.v2","operation":"worker.result","idempotency_key":"result-codex-usage-pending","task_id":"worker-codex-usage"}'
+  out=$(printf '%s\n' "$request" | CODEX_HOME="$codex_home" FM_HOME="$HOME_ROOT" \
+    "$BIN/fm-api.sh" worker.result)
+  status=$?
+  [ "$status" -eq 3 ] || fail "Codex result did not wait for the final turn-end observation"
+  printf '%s\n' "$out" | jq -e '.error == "worker result is finalizing"' >/dev/null \
+    || fail "Codex finalization wait was not structured"
+
+  printf '%s\n' \
+    '{"timestamp":"2023-11-14T22:13:21Z","type":"session_meta","payload":{"timestamp":"2023-11-14T22:13:21Z","cwd":"'"$HOME_ROOT"'/worktree-codex-usage","originator":"codex_exec"}}' \
+    '{"timestamp":"2023-11-14T22:14:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":5}}}}' \
+    >"$sessions/rollout.jsonl"
+  touch "$HOME_ROOT/state/$worker.turn-ended"
+  request='{"schema":"q.firstmate-request.v2","operation":"worker.result","idempotency_key":"result-codex-usage","task_id":"worker-codex-usage"}'
+  out=$(printf '%s\n' "$request" | CODEX_HOME="$codex_home" FM_HOME="$HOME_ROOT" \
+    "$BIN/fm-api.sh" worker.result) || fail "Codex worker.result failed after turn end"
+  printf '%s\n' "$out" | jq -e '
+    .postcondition_evidence.result.usage == [{
+      schema:"q.usage-report.v1",metric:"tokens",amount:65,
+      source:"codex rollout token_count (uncached input + output)"
+    }]
+  ' >/dev/null || fail "Codex structured usage was not attributed to the worker"
+  pass "Codex worker result waits for and reports structured task usage"
 }
 
 test_spawn_requires_metadata_postcondition() {
@@ -402,6 +549,23 @@ test_q_spawn_validation_is_opt_in_and_precedes_mutation() {
     "$ROOT/bin/fm-spawn.sh" ordinary projects/missing --mode local-only --yolo off 2>&1)
   printf '%s\n' "$out" | grep -F 'FM_Q_ROOT_TASK_ID' >/dev/null \
     && fail "ordinary spawn activated Q validation"
+
+  out=$(FM_HOME="$home" FM_Q_MANAGED=1 FM_Q_PREAUTHORIZED=1 \
+    FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-report \
+    FM_Q_LEASE_ID=lease-report FM_Q_PHASE=report \
+    FM_Q_CONTRACT_SCHEMA=q.worker-contract.v2 FM_Q_DEPTH=0 \
+    FM_Q_EXPECTED_WALL_SECONDS=300 FM_Q_CLI=/bin/true \
+    FM_Q_DATA_DIR="$TMP_ROOT/q-data" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" q-v2-report projects/missing --scout \
+    --harness codex --model default --effort medium 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "missing v2 report project should not launch"
+  printf '%s\n' "$out" | grep -F 'FM_Q_CONTRACT_SCHEMA' >/dev/null \
+    && fail "real spawn rejected the v2 worker contract before project validation"
+  printf '%s\n' "$out" | grep -F 'invalid FM_Q_PHASE' >/dev/null \
+    && fail "real spawn rejected the report phase"
+  [ ! -e "$home/state/q-v2-report.meta" ] \
+    || fail "refused v2 report spawn mutated task metadata"
   pass "Q validation is opt-in and refuses before task mutation"
 }
 
@@ -617,8 +781,13 @@ test_delivery_delegates_to_confirming_merge_owner() {
 test_capabilities_are_one_versioned_json_object
 test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
+test_v2_report_worker_contract_prepares_and_spawns
+test_v2_investigation_prepares_without_artifact_publication
 test_worker_result_validates_durable_identity
 test_worker_result_accepts_v2_typed_evidence
+test_worker_result_v3_and_retirement_are_typed_and_idempotent
+test_legacy_v3_investigation_report_is_normalized_to_internal_summary
+test_codex_worker_result_waits_for_and_reports_structured_usage
 test_spawn_requires_metadata_postcondition
 test_supervised_worker_spawn_commits_pre_authorized_lease
 test_report_only_spawn_accepts_inspect_phase

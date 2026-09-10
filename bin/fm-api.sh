@@ -5,7 +5,9 @@
 # Supported operations are fleet.snapshot, worker lifecycle and read-only
 # terminal capture, supervisor prepare/start/send/inspect/stop, and approved
 # delivery execution.
-# Requests use schema q.firstmate-request.v1 and must name the invoked operation.
+# Requests use schema q.firstmate-request.v1 or q.firstmate-request.v2 and must
+# name the invoked operation. V2 is additive for typed Q worker contracts,
+# artifact-backed results, and retirement receipts.
 # Successful stdout contains exactly one fm-api-response.v1 JSON object.
 # Owner diagnostics are forwarded to stderr and never mixed into the response.
 # The facade adds no lifecycle policy: it delegates briefs, spawn, observation,
@@ -86,15 +88,17 @@ case "$OPERATION" in
     jq -cn --arg operation "$OPERATION" --arg revision "$revision" \
       '{schema:"fm-api-response.v1",operation:$operation,result:"ok",idempotency_key:"",
         external_identifiers:{firstmate_revision:$revision},postcondition_evidence:{
-          facade_schemas:["fm-api-response.v1"],request_schemas:["q.firstmate-request.v1"],
+          facade_schemas:["fm-api-response.v1"],
+          request_schemas:["q.firstmate-request.v1","q.firstmate-request.v2"],
           harnesses:["claude","codex","opencode","pi","pi-signed","grok","kimi","cursor","omp","muse","gemini","rovo"],
           backends:["tmux","herdr","zellij","orca","cmux"],
           controls:["interrupt","exit","relaunch"],q_metadata:true,q_spawn_guard:true,
+          retirement_receipts:true,artifact_publication:true,
           delivery_modes:["local-only","direct-PR","no-mistakes"],
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
     ;;
-  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.capture|worker.result|worker.send|worker.control|worker.relaunch|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
+  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.capture|worker.result|worker.send|worker.control|worker.retire|worker.relaunch|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
   *)
     OPERATION=${OPERATION:-unknown}
     respond refused null '"unsupported operation"' null
@@ -105,7 +109,9 @@ esac
 REQUEST_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-api-request.XXXXXX")
 cat >"$REQUEST_FILE"
 if ! jq -e --arg operation "$OPERATION" \
-  'type == "object" and .schema == "q.firstmate-request.v1" and .operation == $operation and
+  'type == "object" and
+   (.schema == "q.firstmate-request.v1" or .schema == "q.firstmate-request.v2") and
+   .operation == $operation and
    (.idempotency_key | type == "string" and length > 0)' "$REQUEST_FILE" >/dev/null; then
   respond refused null '"invalid request schema, operation, or idempotency key"' null
   exit 2
@@ -168,9 +174,11 @@ case "$OPERATION" in
     [ -f "$result_path" ] || { respond refused null '"worker result is missing"' '"wait for a terminal worker result"'; exit 3; }
     q_root=$(sed -n 's/^q_root_task_id=//p' "$meta")
     q_execution=$(sed -n 's/^q_execution_id=//p' "$meta")
-    if ! jq -e --arg root "$q_root" --arg execution "$q_execution" '
+    q_phase=$(sed -n 's/^q_phase=//p' "$meta")
+    if ! jq -e --arg root "$q_root" --arg execution "$q_execution" --arg phase "$q_phase" '
         type == "object" and
-        (.schema == "q.worker-result.v1" or .schema == "q.worker-result.v2") and
+        (.schema == "q.worker-result.v1" or .schema == "q.worker-result.v2" or
+         .schema == "q.worker-result.v3") and
         .root_task_id == $root and .execution_id == $execution and
         (.outcome == "completed" or .outcome == "failed" or .outcome == "blocked") and
         (.summary | type == "string") and (.artifacts | type == "array") and
@@ -187,7 +195,7 @@ case "$OPERATION" in
           (.investigation_report.recommended_implementation | type) == "array" and
           all(.investigation_report.recommended_implementation[]; type == "string") and
           (.investigation_report.authority_expansion_required | type) == "boolean")) and
-        (if .schema == "q.worker-result.v2" then
+        (if .schema == "q.worker-result.v2" or .schema == "q.worker-result.v3" then
           (.evidence | type == "array") and
           all(.evidence[];
             (.kind == "request" or .kind == "repository" or
@@ -205,12 +213,145 @@ case "$OPERATION" in
           (.worktree | type == "string") and
           ((.branch == null) or (.branch | type == "string")) and
           (.completed_at | type == "string")
+        else true end) and
+        (if .schema == "q.worker-result.v3" then
+          (.execution_generation | type == "number") and
+          .execution_generation == (.execution_generation | floor) and
+          .execution_generation >= 1 and
+          (.result_generation | type == "number") and
+          .result_generation == (.result_generation | floor) and
+          .result_generation >= 1 and
+          (.finality == "candidate" or .finality == "final" or .finality == "partial") and
+          (.disposition == "report_only" or .disposition == "changeset") and
+          (.primary_output | type == "object") and
+          (.primary_output.kind == "summary" or .primary_output.kind == "report" or
+           .primary_output.kind == "changeset") and
+          (.primary_output.title | type == "string" and length > 0 and length <= 200) and
+          (.primary_output.completeness == "complete" or
+           .primary_output.completeness == "partial") and
+          ((.primary_output.media_type == null) or
+           (.primary_output.media_type == "text/markdown; charset=utf-8") or
+           (.primary_output.media_type == "text/plain; charset=utf-8")) and
+          ((.primary_output.artifact_id == null) or
+           (.primary_output.artifact_id | type == "string" and length > 0)) and
+          ((.artifact_manifest_id == null) or
+           (.artifact_manifest_id | type == "string" and length > 0)) and
+          (if .primary_output.kind == "report" then
+             (($phase == "investigation" and .investigation_report != null) or
+              ((.primary_output.artifact_id | type == "string" and length > 0) and
+               (.primary_output.media_type | type == "string") and
+               (.artifact_manifest_id | type == "string" and length > 0)))
+           elif .primary_output.kind == "summary" then
+             .primary_output.artifact_id == null
+           else true end) and
+          (if .disposition == "report_only" then
+             .primary_output.kind != "changeset"
+           else true end)
         else true end)
       ' "$result_path" >/dev/null 2>&1; then
       respond refused null '"worker result is invalid or belongs to another execution"' '"preserve and repair the typed result"'
       exit 3
     fi
-    result=$(jq -c . "$result_path")
+    harness=$(sed -n 's/^harness=//p' "$meta")
+    if [ "$harness" = codex ]; then
+      turn_ended="$FM_HOME/state/$task_id.turn-ended"
+      if [ ! -f "$turn_ended" ] || [ "$result_path" -nt "$turn_ended" ]; then
+        respond refused null '"worker result is finalizing"' '"wait for the Codex turn-end usage observation"'
+        exit 3
+      fi
+      # Codex invokes the turn-end notification immediately before its rollout
+      # writer closes. Give that structured final token event a bounded flush
+      # interval before reading it.
+      sleep 0.1
+    fi
+    result=$(python3 - "$result_path" "$meta" "${CODEX_HOME:-$HOME/.codex}" <<'PY'
+import datetime
+import json
+import os
+import re
+import sys
+
+result_path, meta_path, codex_home = sys.argv[1:]
+with open(result_path, encoding="utf-8") as stream:
+    result = json.load(stream)
+with open(meta_path, encoding="utf-8") as stream:
+    meta = dict(
+        line.rstrip("\n").split("=", 1)
+        for line in stream
+        if "=" in line
+    )
+
+if meta.get("q_phase") == "investigation":
+    result["primary_output"] = {
+        "kind": "summary",
+        "title": "Investigation handoff",
+        "media_type": None,
+        "artifact_id": None,
+        "completeness": result.get("primary_output", {}).get("completeness", "complete"),
+    }
+    result["artifact_manifest_id"] = None
+
+if meta.get("harness") == "codex":
+    spawn_match = re.fullmatch(r"s(\d+)\..+", meta.get("spawn_gen", ""))
+    worktree = os.path.realpath(meta.get("worktree", ""))
+    sessions_root = os.path.join(codex_home, "sessions")
+    total = 0
+    matched = False
+    if spawn_match and worktree and os.path.isdir(sessions_root):
+        spawn_epoch = int(spawn_match.group(1))
+        for directory, _, names in os.walk(sessions_root):
+            for name in names:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(directory, name)
+                try:
+                    if os.path.getmtime(path) + 60 < spawn_epoch:
+                        continue
+                    session_matches = False
+                    last_usage = None
+                    with open(path, encoding="utf-8") as stream:
+                        for line in stream:
+                            event = json.loads(line)
+                            payload = event.get("payload", {})
+                            if event.get("type") == "session_meta":
+                                timestamp = payload.get("timestamp")
+                                try:
+                                    started = datetime.datetime.fromisoformat(
+                                        timestamp.replace("Z", "+00:00")
+                                    ).timestamp()
+                                except (AttributeError, ValueError):
+                                    started = 0
+                                session_matches = (
+                                    os.path.realpath(payload.get("cwd", "")) == worktree
+                                    and payload.get("originator") == "codex_exec"
+                                    and started >= spawn_epoch
+                                )
+                            elif payload.get("type") == "token_count":
+                                last_usage = payload.get("info", {}).get("total_token_usage")
+                    if session_matches and isinstance(last_usage, dict):
+                        input_tokens = int(last_usage.get("input_tokens", 0))
+                        cached_tokens = int(last_usage.get("cached_input_tokens", 0))
+                        output_tokens = int(last_usage.get("output_tokens", 0))
+                        total += max(input_tokens - cached_tokens, 0) + max(output_tokens, 0)
+                        matched = True
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+    if matched:
+        result["usage"] = [
+            item for item in result.get("usage", []) if item.get("metric") != "tokens"
+        ]
+        result["usage"].append(
+            {
+                "schema": "q.usage-report.v1",
+                "metric": "tokens",
+                "amount": total,
+                "source": "codex rollout token_count (uncached input + output)",
+            }
+        )
+
+print(json.dumps(result, separators=(",", ":")))
+PY
+    )
     respond ok "$(jq -cn --arg path "$result_path" --argjson result "$result" '{result:$result,path:$path}')"
     ;;
   worker.prepare)
@@ -218,6 +359,87 @@ case "$OPERATION" in
     repo_name=$(jq -r '.repository_name // empty' "$REQUEST_FILE")
     kind=$(jq -r '.kind // "ship"' "$REQUEST_FILE")
     mode=$(jq -r '.mode // empty' "$REQUEST_FILE")
+    if [ "$(jq -r .schema "$REQUEST_FILE")" = q.firstmate-request.v2 ]; then
+      python3 - "$REQUEST_FILE" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    request = json.load(stream)
+contract = request.get("worker_contract", {})
+result = request.get("result_contract", {})
+phase = contract.get("phase")
+disposition = contract.get("disposition")
+if phase == "investigation":
+    result["primary_output"] = {
+        "kind": "summary",
+        "title": "Investigation handoff",
+        "media_type": None,
+        "artifact_id": None,
+        "completeness": "complete|partial",
+    }
+    result["artifact_manifest_id"] = None
+elif disposition == "report_only" and contract.get("output_artifact_ids"):
+    result["primary_output"] = {
+        "kind": "report",
+        "title": "human-readable title",
+        "media_type": "text/markdown; charset=utf-8",
+        "artifact_id": contract["output_artifact_ids"][0],
+        "completeness": "complete|partial",
+    }
+    result["artifact_manifest_id"] = contract.get("output_manifest_id")
+elif disposition == "changeset":
+    result["primary_output"] = {
+        "kind": "changeset",
+        "title": "human-readable title",
+        "media_type": None,
+        "artifact_id": None,
+        "completeness": "complete|partial",
+    }
+    result["artifact_manifest_id"] = None
+request["result_contract"] = result
+temporary = path + ".canonical"
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump(request, stream, separators=(",", ":"))
+os.replace(temporary, path)
+PY
+    fi
+    if [ "$(jq -r .schema "$REQUEST_FILE")" = q.firstmate-request.v2 ] && ! jq -e '
+        (.worker_contract | type == "object") and
+        .worker_contract.schema == "q.worker-contract.v2" and
+        .worker_contract.execution_id == .task_id and
+        (.worker_contract.root_task_id | type == "string" and length > 0) and
+        (.result_contract | type == "object") and
+        .result_contract.schema == "q.worker-result.v3" and
+        .result_contract.execution_id == .task_id and
+        .result_contract.root_task_id == .worker_contract.root_task_id and
+        (if (.worker_contract.phase == "investigation" or
+             .worker_contract.disposition == "changeset") then
+          ((.worker_contract.output_manifest_id == null and
+            .worker_contract.output_artifact_ids == [] and
+            .worker_contract.publication_directory == null) or
+           ((.worker_contract.output_manifest_id | type == "string" and length > 0) and
+            (.worker_contract.output_artifact_ids | type == "array" and length > 0) and
+            (.worker_contract.publication_directory | type == "string" and startswith("/")))) and
+          .result_contract.artifact_manifest_id == null and
+          .result_contract.primary_output.artifact_id == null and
+          (.result_contract.primary_output.kind ==
+            (if .worker_contract.phase == "investigation" then "summary" else "changeset" end))
+        else
+          (.worker_contract.output_manifest_id | type == "string" and length > 0) and
+          (.worker_contract.output_artifact_ids | type == "array" and length > 0) and
+          (.worker_contract.publication_directory | type == "string" and startswith("/")) and
+          .result_contract.artifact_manifest_id == .worker_contract.output_manifest_id and
+          .result_contract.primary_output.artifact_id ==
+            .worker_contract.output_artifact_ids[0] and
+          .result_contract.primary_output.kind == "report"
+        end)
+      ' "$REQUEST_FILE" >/dev/null; then
+      respond refused null '"invalid v2 worker preparation contract"' null
+      exit 2
+    fi
     case "$kind" in
       ship) run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-brief.sh" "$task_id" "$repo_name" --mode "$mode" || exit $? ;;
       scout) run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-brief.sh" "$task_id" "$repo_name" --scout || exit $? ;;
@@ -243,6 +465,26 @@ brief += "or a Firstmate completion gate. Do not mark the work blocked merely be
 brief += "tools are absent. Set outcome from the assigned task itself, atomically publish the "
 brief += "typed result, and then stop.\n"
 brief += "Do not call no-mistakes; Quartermaster owns any separate validation.\n"
+publication = request.get("worker_contract", {}).get("publication_directory")
+contract = request.get("worker_contract", {})
+result_contract = request.get("result_contract", {})
+if publication and result_contract.get("artifact_manifest_id"):
+    brief += "The Quartermaster artifact publication directory `" + publication + "` is an "
+    brief += "additional permitted write location for the declared artifacts and manifest; "
+    brief += "this permission overrides the scout scaffold's report-only outside-write rule.\n"
+    ids = contract.get("output_artifact_ids", [])
+    role = contract.get("role")
+    if role == "report_reviewer":
+        mapping = ids[0] + " = report_review (`q.report-review.v1`)"
+    elif role == "report_inspector":
+        mapping = ids[0] + " = report_inspection (`q.report-evidence.v1`)"
+    else:
+        mapping = ids[0] + " = report (`report.md`)"
+        if len(ids) > 1:
+            mapping += ", " + ids[1] + " = report_evidence (`q.report-evidence.v1`)"
+    brief += "Publish these exact allocated identities: " + mapping + ". Write artifact files "
+    brief += "first, then `manifest.json` as `q.artifact-manifest.v1` with exact byte sizes and "
+    brief += "SHA-256 digests, then q-result.json last; use atomic rename for each publication.\n"
 brief += "Copy observed_repository exactly from the result contract (it is the primary "
 brief += "repository), and record the isolated checkout separately in worktree. Never replace "
 brief += "observed_repository with pwd. Copy the exact starting revision unless the worker "
@@ -282,6 +524,9 @@ PY
     q_wall=$(jq -r '.q.expected_wall_seconds // 1' "$REQUEST_FILE")
     q_cli=$(jq -r '.q.guard_executable // empty' "$REQUEST_FILE")
     q_data_dir=$(jq -r '.q.data_dir // empty' "$REQUEST_FILE")
+    request_schema=$(jq -r .schema "$REQUEST_FILE")
+    q_contract_schema=q.worker-contract.v1
+    [ "$request_schema" != q.firstmate-request.v2 ] || q_contract_schema=q.worker-contract.v2
     if [ -z "$q_cli" ] || [ -z "$q_data_dir" ]; then
       respond refused null '"Q-managed workers require a durable guard executable and data directory"' null
       exit 2
@@ -298,7 +543,7 @@ PY
     run_owner env FM_HOME="$FM_HOME" FM_Q_MANAGED=1 FM_Q_PREAUTHORIZED=1 \
       FM_Q_ROOT_TASK_ID="$q_root" FM_Q_EXECUTION_ID="$q_execution" \
       FM_Q_PARENT_EXECUTION_ID="$q_parent" FM_Q_LEASE_ID="$q_lease" \
-      FM_Q_PHASE="$q_phase" FM_Q_CONTRACT_SCHEMA=q.worker-contract.v1 \
+      FM_Q_PHASE="$q_phase" FM_Q_CONTRACT_SCHEMA="$q_contract_schema" \
       FM_Q_TRACE_ID="$q_trace" FM_Q_DEPTH="$q_depth" \
       FM_Q_DELEGATION_ENABLED="$q_delegation" FM_Q_EXPECTED_WALL_SECONDS="$q_wall" \
       FM_Q_CLI="$q_cli" FM_Q_DATA_DIR="$q_data_dir" \
@@ -338,6 +583,64 @@ PY
       --arg worktree "$worktree" --arg branch "$branch" --arg revision "$observed_revision" \
       '{task_id:$task_id,metadata_path:$meta,worktree:$worktree,
         branch:(if $branch == "" then null else $branch end),observed_revision:$revision}')"
+    ;;
+  worker.retire)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    case "$task_id" in
+      ''|*[!A-Za-z0-9._:-]*) respond refused null '"invalid worker identity"' null; exit 2 ;;
+    esac
+    meta="$FM_HOME/state/$task_id.meta"
+    result_path="$FM_HOME/data/$task_id/q-result.json"
+    receipt_path="$FM_HOME/state/$task_id.q-retirement-receipt.json"
+    [ -f "$meta" ] || { respond refused null '"worker metadata is missing"' null; exit 3; }
+    q_root=$(sed -n 's/^q_root_task_id=//p' "$meta")
+    q_execution=$(sed -n 's/^q_execution_id=//p' "$meta")
+    worktree=$(sed -n 's/^worktree=//p' "$meta")
+    [ -f "$result_path" ] || { respond refused null '"worker result is missing"' '"wait for a terminal worker result"'; exit 3; }
+    if ! jq -e --arg root "$q_root" --arg execution "$q_execution" '
+        .schema == "q.worker-result.v3" and .root_task_id == $root and
+        .execution_id == $execution and
+        (.execution_generation | type == "number") and
+        .execution_generation == (.execution_generation | floor) and
+        .execution_generation >= 1 and
+        (.outcome == "completed" or .outcome == "failed" or .outcome == "blocked")
+      ' "$result_path" >/dev/null 2>&1; then
+      respond refused null '"worker retirement requires an attributed terminal v3 result"' null
+      exit 3
+    fi
+    generation=$(jq -r .execution_generation "$result_path")
+    if [ -f "$receipt_path" ]; then
+      if ! jq -e --arg root "$q_root" --argjson generation "$generation" '
+          (.retirement_receipt_id | type == "string" and length > 0) and
+          .retirement_receipt.schema == "fm.retirement-receipt.v1" and
+          .retirement_receipt.root_task_id == $root and
+          .retirement_receipt.execution_generation == $generation
+        ' "$receipt_path" >/dev/null 2>&1; then
+        respond error null '"stored worker retirement receipt is invalid"' '"preserve the worker and reconcile its retirement record"'
+        exit 1
+      fi
+      respond ok "$(jq -c . "$receipt_path")"
+      exit 0
+    fi
+    run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-control.sh" "$task_id" exit || exit $?
+    observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    receipt_id="retirement-$task_id"
+    receipt=$(jq -cn --arg id "$receipt_id" --arg root "$q_root" \
+      --arg task "$task_id" --arg worktree "$worktree" --arg observed "$observed_at" \
+      --argjson generation "$generation" \
+      '{retirement_receipt_id:$id,retirement_receipt:{
+        schema:"fm.retirement-receipt.v1",root_task_id:$root,
+        execution_generation:$generation,operation_id:("worker-retire:" + $task),
+        run_id:("worker:" + $task),
+        actors:[{actor_id:$task,state:"retired",role:"worker"}],
+        driver_state:"retired",supervisor_state:"not_applicable",mutation_owner:"none",
+        retained_work_locations:(if $worktree == "" then [] else [$worktree] end),
+        observation_daemon:null,observed_at:$observed}}')
+    receipt_tmp=$(mktemp "$FM_HOME/state/.$task_id.q-retirement.XXXXXX")
+    printf '%s\n' "$receipt" >"$receipt_tmp"
+    chmod 600 "$receipt_tmp"
+    mv "$receipt_tmp" "$receipt_path"
+    respond ok "$receipt"
     ;;
   worker.send)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")

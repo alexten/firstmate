@@ -274,6 +274,23 @@ test_worker_result_v3_and_retirement_are_typed_and_idempotent() {
   pass "worker result v3 and retirement are typed and idempotent"
 }
 
+test_worker_result_v3_canonicalizes_redundant_artifact_declarations() {
+  worker='worker-v3-redundant-artifacts'
+  mkdir -p "$HOME_ROOT/data/$worker" "$HOME_ROOT/state"
+  printf '%s\n' 'q_root_task_id=task-v3-redundant-artifacts' \
+    'q_execution_id=exec-v3-redundant-artifacts' \
+    >"$HOME_ROOT/state/$worker.meta"
+  printf '%s\n' \
+    '{"schema":"q.worker-result.v3","root_task_id":"task-v3-redundant-artifacts","execution_id":"exec-v3-redundant-artifacts","execution_generation":1,"result_generation":1,"outcome":"completed","summary":"Readiness report completed.","artifacts":[{"id":"artifact-report","kind":"report","title":"Readiness","media_type":"text/markdown; charset=utf-8","path":"report.md","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":42,"completeness":"complete","supersedes_artifact_id":null}],"investigation_report":null,"usage":[],"evidence":[],"observed_repository":"/repo","observed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-10T00:00:00Z","finality":"final","disposition":"report_only","primary_output":{"kind":"report","title":"Readiness","media_type":"text/markdown; charset=utf-8","artifact_id":"artifact-report","completeness":"complete"},"artifact_manifest_id":"manifest-report","supersedes_result_id":null,"validation_binding":null}' \
+    >"$HOME_ROOT/data/$worker/q-result.json"
+  request='{"schema":"q.firstmate-request.v2","operation":"worker.result","idempotency_key":"result-v3-redundant-artifacts","task_id":"worker-v3-redundant-artifacts"}'
+  out=$(invoke worker.result "$request") || fail "worker.result rejected redundant v3 declarations"
+  printf '%s\n' "$out" | jq -e \
+    '.result == "ok" and .postcondition_evidence.result.artifacts == []' \
+    >/dev/null || fail "worker.result did not canonicalize redundant v3 declarations"
+  pass "worker result v3 canonicalizes redundant artifact declarations"
+}
+
 test_legacy_v3_investigation_report_is_normalized_to_internal_summary() {
   worker='worker-investigation-result'
   mkdir -p "$HOME_ROOT/data/$worker" "$HOME_ROOT/state"
@@ -786,6 +803,7 @@ test_v2_investigation_prepares_without_artifact_publication
 test_worker_result_validates_durable_identity
 test_worker_result_accepts_v2_typed_evidence
 test_worker_result_v3_and_retirement_are_typed_and_idempotent
+test_worker_result_v3_canonicalizes_redundant_artifact_declarations
 test_legacy_v3_investigation_report_is_normalized_to_internal_summary
 test_codex_worker_result_waits_for_and_reports_structured_usage
 test_spawn_requires_metadata_postcondition

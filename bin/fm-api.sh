@@ -182,6 +182,23 @@ case "$OPERATION" in
         .root_task_id == $root and .execution_id == $execution and
         (.outcome == "completed" or .outcome == "failed" or .outcome == "blocked") and
         (.summary | type == "string") and (.artifacts | type == "array") and
+        (if .schema == "q.worker-result.v3" then
+          all(.artifacts[];
+            (type == "string") or
+            ((type == "object") and
+             (.id | type == "string" and length > 0) and
+             (.kind | type == "string" and length > 0) and
+             (.title | type == "string" and length > 0) and
+             (.media_type | type == "string" and length > 0) and
+             (.path | type == "string" and length > 0) and
+             (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+             (.size | type == "number" and . >= 0 and . == floor) and
+             (.completeness == "complete" or .completeness == "partial") and
+             ((.supersedes_artifact_id == null) or
+              (.supersedes_artifact_id | type == "string" and length > 0))))
+        else
+          all(.artifacts[]; type == "string")
+        end) and
         ((.investigation_report == null) or
          ((.investigation_report | type) == "object" and
           .investigation_report.schema == "q.investigation-report.v1" and
@@ -280,6 +297,14 @@ with open(meta_path, encoding="utf-8") as stream:
         for line in stream
         if "=" in line
     )
+
+# Artifact declarations are authoritative only in q.artifact-manifest.v1.
+# Some workers redundantly copy those declarations into v3's retained legacy
+# artifacts field even though the issued result contract requires an empty
+# array.  Remove that redundant representation at the facade boundary; Q still
+# verifies the preallocated manifest and every declared byte before acceptance.
+if result.get("schema") == "q.worker-result.v3":
+    result["artifacts"] = []
 
 if meta.get("q_phase") == "investigation":
     result["primary_output"] = {
@@ -483,8 +508,10 @@ if publication and result_contract.get("artifact_manifest_id"):
         if len(ids) > 1:
             mapping += ", " + ids[1] + " = report_evidence (`q.report-evidence.v1`)"
     brief += "Publish these exact allocated identities: " + mapping + ". Write artifact files "
-    brief += "first, then `manifest.json` as `q.artifact-manifest.v1` with exact byte sizes and "
-    brief += "SHA-256 digests, then q-result.json last; use atomic rename for each publication.\n"
+    brief += "first, then `manifest.json` as `q.artifact-manifest.v1` using only the top-level "
+    brief += "fields `schema`, `id`, `root_task_id`, `execution_id`, `result_generation`, and "
+    brief += "`artifacts`, with exact byte sizes and SHA-256 digests, then q-result.json last; "
+    brief += "use atomic rename for each publication.\n"
 brief += "Copy observed_repository exactly from the result contract (it is the primary "
 brief += "repository), and record the isolated checkout separately in worktree. Never replace "
 brief += "observed_repository with pwd. Copy the exact starting revision unless the worker "
@@ -497,6 +524,9 @@ brief += "Before reporting a terminal status, generate the result with a JSON se
 brief += "validate it with `jq -e .`, and atomically write strict JSON to `"
 brief += request["result_path"] + "` matching this contract:\n\n```json\n"
 brief += json.dumps(request["result_contract"], indent=2) + "\n```\n"
+if request.get("result_contract", {}).get("schema") == "q.worker-result.v3":
+    brief += "Keep the legacy `artifacts` field exactly `[]`; artifact declarations belong "
+    brief += "only in the separately published `q.artifact-manifest.v1`.\n"
 temporary = brief_path + ".q-tmp"
 with open(temporary, "w", encoding="utf-8") as stream:
     stream.write(brief)

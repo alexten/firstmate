@@ -60,7 +60,8 @@ fm_q_guard_authorize_child() {  # <task-id> <kind> <harness> <model> <effort>
       (.lease_id | type == "string" and length > 0) and
       (.requested_depth | type == "number") and
       (if .result == "authorized" then
-         .result_contract.schema == "q.worker-result.v2" and
+         (.result_contract.schema == "q.worker-result.v2" or
+          .result_contract.schema == "q.worker-result.v3") and
          (.result_contract.observed_repository | type == "string")
        else true end)
     ' >/dev/null 2>&1 <<<"$response"; then
@@ -87,12 +88,38 @@ fm_q_guard_authorize_child() {  # <task-id> <kind> <harness> <model> <effort>
 }
 
 fm_q_guard_append_child_result_contract() {  # <task-id>
-  local child_id=$1 brief result_path
+  local child_id=$1 brief result_path opaque_root opaque_record selection selection_path
+  local selection_tmp
   [ "${FM_Q_GUARD_ACQUIRED:-0}" = 1 ] || return 0
   [ -n "${FM_Q_RESULT_CONTRACT:-}" ] || return 1
   brief="$DATA/$child_id/brief.md"
   result_path="$DATA/$child_id/q-result.json"
   [ -f "$brief" ] || return 1
+  if jq -e '.opaque_no_mistakes != null' >/dev/null 2>&1 <<<"$FM_Q_RESULT_CONTRACT"; then
+    opaque_root=$(jq -r '.root_task_id' <<<"$FM_Q_RESULT_CONTRACT")
+    opaque_record="$DATA/q-opaque-no-mistakes/$opaque_root.json"
+    [ -f "$opaque_record" ] || {
+      echo "error: selected opaque custodian has no durable supervisor instruction" >&2
+      return 1
+    }
+    selection_path="$DATA/q-opaque-no-mistakes/$opaque_root-selection.json"
+    selection=$(jq -cn --arg root "$opaque_root" --arg execution "$FM_Q_EXECUTION_ID" \
+      --arg external "$child_id" --slurpfile accepted "$opaque_record" \
+      '{schema:"fm.opaque-custodian-selection.v1",root_task_id:$root,
+        opaque_operation_id:$accepted[0].opaque_operation_id,
+        execution_id:$execution,external_task_id:$external}') || return 1
+    if [ -f "$selection_path" ]; then
+      [ "$(jq -S -c . <<<"$selection")" = "$(jq -S -c . "$selection_path" 2>/dev/null)" ] || {
+        echo "error: opaque custodian selection conflicts with its durable record" >&2
+        return 1
+      }
+    else
+      selection_tmp=$(mktemp "$DATA/q-opaque-no-mistakes/.selection.XXXXXX") || return 1
+      printf '%s\n' "$selection" >"$selection_tmp"
+      chmod 600 "$selection_tmp"
+      mv "$selection_tmp" "$selection_path"
+    fi
+  fi
   python3 - "$brief" "$result_path" "$FM_Q_RESULT_CONTRACT" <<'PY'
 import json
 import os
@@ -111,6 +138,13 @@ brief += "revision; record `pwd -P` separately as worktree and copy observed_rep
 brief += "exactly from the contract. Generate with a JSON serializer, validate with "
 brief += "`jq -e .`, then atomically publish strict JSON to `" + result_path + "`:\n\n"
 brief += "```json\n" + json.dumps(contract, indent=2) + "\n```\n"
+if contract.get("opaque_no_mistakes"):
+    brief += "The operator explicitly accepted this task's ungoverned compatibility path. "
+    brief += "You are the single selected implementation custodian. Complete the ordinary "
+    brief += "no-mistakes workflow before publishing the final result claim. Never pass "
+    brief += "--yes or -y, never answer a question automatically, and never merge. "
+    brief += "Quartermaster will observe final repository and PR identity separately and "
+    brief += "does not attest provider internals or shutdown.\n"
 temporary = brief_path + ".q-result-tmp"
 with open(temporary, "w", encoding="utf-8") as stream:
     stream.write(brief)

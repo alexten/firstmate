@@ -56,6 +56,16 @@ require_tools() {
   }
 }
 
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
 run_owner() {
   OWNER_OUT=$(mktemp "${TMPDIR:-/tmp}/fm-api-out.XXXXXX")
   OWNER_ERR=$(mktemp "${TMPDIR:-/tmp}/fm-api-err.XXXXXX")
@@ -94,11 +104,17 @@ case "$OPERATION" in
           backends:["tmux","herdr","zellij","orca","cmux"],
           controls:["interrupt","exit","relaunch"],q_metadata:true,q_spawn_guard:true,
           retirement_receipts:true,artifact_publication:true,
+          typed_pr_observation:true,
           delivery_modes:["local-only","direct-PR","no-mistakes"],
+          opaque_no_mistakes:{schema:"fm.opaque-no-mistakes.v1",supported:true,
+            delivery_modes:["no_mistakes_pr"],final_result:true,
+            final_head_observation:true,worker_stop_observation:true,
+            native_hard_bounds:false,provider_events:false,
+            provider_attestation:false,provider_retirement:false},
           fleet_snapshot_schema:"fm-fleet-snapshot.v1"},error:null,recoverable_next_action:null}'
     exit 0
     ;;
-  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.capture|worker.result|worker.send|worker.control|worker.retire|worker.relaunch|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute) ;;
+  fleet.snapshot|worker.prepare|worker.spawn|worker.inspect|worker.capture|worker.result|worker.send|worker.control|worker.retire|worker.relaunch|worker.cleanup|supervisor.prepare|supervisor.start|supervisor.send|supervisor.inspect|supervisor.stop|delivery.execute|delivery.inspect) ;;
   *)
     OPERATION=${OPERATION:-unknown}
     respond refused null '"unsupported operation"' null
@@ -269,6 +285,45 @@ case "$OPERATION" in
       respond refused null '"worker result is invalid or belongs to another execution"' '"preserve and repair the typed result"'
       exit 3
     fi
+    opaque_record="$FM_HOME/data/$task_id/q-opaque-no-mistakes.json"
+    opaque_selection=
+    if [ ! -f "$opaque_record" ] && [ -n "$q_root" ] && \
+       [ -f "$FM_HOME/data/q-opaque-no-mistakes/$q_root.json" ]; then
+      opaque_record="$FM_HOME/data/q-opaque-no-mistakes/$q_root.json"
+      opaque_selection="$FM_HOME/data/q-opaque-no-mistakes/$q_root-selection.json"
+      if [ ! -f "$opaque_selection" ] || ! jq -e \
+          --arg root "$q_root" --arg execution "$q_execution" --arg external "$task_id" \
+          --slurpfile accepted "$opaque_record" '
+            .schema == "fm.opaque-custodian-selection.v1" and
+            .root_task_id == $root and
+            .opaque_operation_id == $accepted[0].opaque_operation_id and
+            .execution_id == $execution and .external_task_id == $external
+          ' "$opaque_selection" >/dev/null 2>&1; then
+        respond refused null '"opaque supervised custodian selection is missing or mismatched"' \
+          '"preserve the selected work and reconcile the durable supervisor selection"'
+        exit 3
+      fi
+    fi
+    if [ -f "$opaque_record" ] && ! jq -e --slurpfile accepted "$opaque_record" '
+        (.opaque_no_mistakes | type == "object") and
+        .opaque_no_mistakes.schema == "q.opaque-no-mistakes-claim.v1" and
+        .opaque_no_mistakes.opaque_operation_id == $accepted[0].opaque_operation_id and
+        .opaque_no_mistakes.risk_acceptance_id == $accepted[0].risk_acceptance_id and
+        .opaque_no_mistakes.risk_acceptance_sha256 ==
+          $accepted[0].risk_acceptance_sha256 and
+        (.opaque_no_mistakes.outcome == "passed" or
+         .opaque_no_mistakes.outcome == "failed" or
+         .opaque_no_mistakes.outcome == "cancelled" or
+         .opaque_no_mistakes.outcome == "blocked" or
+         .opaque_no_mistakes.outcome == "unknown") and
+        ((.opaque_no_mistakes.native_run_id == null) or
+         (.opaque_no_mistakes.native_run_id | type == "string" and length > 0)) and
+        .finality == "final"
+      ' "$result_path" >/dev/null 2>&1; then
+      respond refused null '"opaque worker result is missing its bound terminal claim"' \
+        '"preserve and repair the typed result without restarting no-mistakes"'
+      exit 3
+    fi
     harness=$(sed -n 's/^harness=//p' "$meta")
     if [ "$harness" = codex ]; then
       turn_ended="$FM_HOME/state/$task_id.turn-ended"
@@ -281,14 +336,35 @@ case "$OPERATION" in
       # interval before reading it.
       sleep 0.1
     fi
-    result=$(python3 - "$result_path" "$meta" "${CODEX_HOME:-$HOME/.codex}" <<'PY'
+    opaque_worker_state=unknown
+    if [ -f "$opaque_record" ]; then
+      snapshot_file=$(mktemp "${TMPDIR:-/tmp}/fm-api-opaque-snapshot.XXXXXX")
+      if env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json \
+          >"$snapshot_file" 2>/dev/null; then
+        if jq -e --arg id "$task_id" '
+            [.tasks[] | select(.id == $id)][0] as $task |
+            ($task == null) or
+            (($task.endpoint.exists // false) != true) or
+            (($task.endpoint.agent_alive // "not_checked") == "dead") or
+            ($task.current_state.state == "done") or
+            ($task.current_state.state == "failed")
+          ' "$snapshot_file" >/dev/null 2>&1; then
+          opaque_worker_state=stopped
+        fi
+      fi
+      rm -f "$snapshot_file"
+    fi
+    result_payload=$(python3 - "$result_path" "$meta" "${CODEX_HOME:-$HOME/.codex}" \
+      "$opaque_record" "$opaque_worker_state" "$task_id" <<'PY'
 import datetime
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
-result_path, meta_path, codex_home = sys.argv[1:]
+result_path, meta_path, codex_home, opaque_path, worker_state, external_task_id = sys.argv[1:]
 with open(result_path, encoding="utf-8") as stream:
     result = json.load(stream)
 with open(meta_path, encoding="utf-8") as stream:
@@ -305,6 +381,24 @@ with open(meta_path, encoding="utf-8") as stream:
 # verifies the preallocated manifest and every declared byte before acceptance.
 if result.get("schema") == "q.worker-result.v3":
     result["artifacts"] = []
+    result.setdefault("investigation_report", None)
+    result.setdefault("usage", [])
+    result.setdefault("evidence", [])
+    result.setdefault("branch", None)
+    result.setdefault("artifact_manifest_id", None)
+    result.setdefault("supersedes_result_id", None)
+    result.setdefault("validation_binding", None)
+    result.setdefault("opaque_no_mistakes", None)
+    for evidence in result["evidence"]:
+        evidence.setdefault("command", None)
+    primary_output = result.get("primary_output")
+    if isinstance(primary_output, dict):
+        primary_output.setdefault("media_type", None)
+        primary_output.setdefault("artifact_id", None)
+        primary_output.setdefault("completeness", "complete")
+    opaque_claim = result.get("opaque_no_mistakes")
+    if isinstance(opaque_claim, dict):
+        opaque_claim.setdefault("native_run_id", None)
 
 if meta.get("q_phase") == "investigation":
     result["primary_output"] = {
@@ -379,16 +473,147 @@ if meta.get("harness") == "codex":
             }
         )
 
-print(json.dumps(result, separators=(",", ":")))
+opaque_result = None
+if os.path.isfile(opaque_path):
+    with open(opaque_path, encoding="utf-8") as stream:
+        accepted = json.load(stream)
+    worktree = os.path.realpath(meta.get("worktree", result.get("worktree", "")))
+    try:
+        final_head = subprocess.run(
+            ["git", "-C", worktree, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        final_head = ""
+    claim = result["opaque_no_mistakes"]
+    accepted_at = datetime.datetime.fromtimestamp(
+        os.path.getmtime(opaque_path), tz=datetime.timezone.utc
+    ).isoformat()
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    canonical = json.dumps(result, sort_keys=True, separators=(",", ":"))
+    limitations = [
+        "provider_actor_count_unenforced",
+        "provider_concurrency_unenforced",
+        "provider_delegation_depth_unenforced",
+        "provider_repair_rounds_unenforced",
+        "provider_turns_tokens_cost_unenforced",
+        "provider_decisions_not_recorded_by_q",
+        "provider_shutdown_not_provable",
+        "provider_result_not_attested",
+    ]
+    opaque_result = {
+        "schema": "fm.opaque-no-mistakes-result.v1",
+        "root_task_id": result["root_task_id"],
+        "execution_generation": result["execution_generation"],
+        "execution_id": result["execution_id"],
+        "external_task_id": external_task_id,
+        "metadata_generation": meta.get("spawn_gen", "unknown"),
+        "opaque_operation_id": accepted["opaque_operation_id"],
+        "risk_acceptance_id": accepted["risk_acceptance_id"],
+        "risk_acceptance_sha256": accepted["risk_acceptance_sha256"],
+        "repository": result["observed_repository"],
+        "base_revision": accepted["base_revision"],
+        "worktree": worktree,
+        "branch": result.get("branch"),
+        "observed_final_head": final_head,
+        "worker_result_id": "worker-result:" + result["execution_id"],
+        "result_generation": result["result_generation"],
+        "worker_result_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+        "claimed_final_revision": result["observed_revision"],
+        "claimed_no_mistakes_outcome": claim["outcome"],
+        "native_run_id": claim.get("native_run_id"),
+        "pull_request": None,
+        "worker_state": worker_state,
+        "accepted_at": accepted_at,
+        "observed_at": observed_at,
+        "limitations": limitations,
+    }
+
+print(json.dumps({"result": result, "opaque": opaque_result}, separators=(",", ":")))
 PY
     )
-    respond ok "$(jq -cn --arg path "$result_path" --argjson result "$result" '{result:$result,path:$path}')"
+    result=$(jq -c .result <<<"$result_payload")
+    opaque_result=$(jq -c .opaque <<<"$result_payload")
+    if [ "$opaque_result" != null ]; then
+      opaque_final_record="${opaque_record%.json}-result.json"
+      if [ -f "$opaque_final_record" ]; then
+        requested_final=$(jq -S -c 'del(.observed_at)' <<<"$opaque_result")
+        recorded_final=$(jq -S -c 'del(.observed_at)' "$opaque_final_record" 2>/dev/null || true)
+        if [ "$requested_final" != "$recorded_final" ]; then
+          respond conflict null '"opaque terminal result identity was reused with different bytes"' \
+            '"preserve the recorded terminal result and reconcile the caller"'
+          exit 3
+        fi
+        opaque_result=$(jq -c . "$opaque_final_record")
+      else
+        mkdir -p "$(dirname "$opaque_final_record")"
+        opaque_final_tmp=$(mktemp "$(dirname "$opaque_final_record")/.q-opaque-result.XXXXXX")
+        jq -S . <<<"$opaque_result" >"$opaque_final_tmp"
+        chmod 600 "$opaque_final_tmp"
+        mv "$opaque_final_tmp" "$opaque_final_record"
+        opaque_result=$(jq -c . "$opaque_final_record")
+      fi
+    fi
+    respond ok "$(jq -cn --arg path "$result_path" --argjson result "$result" \
+      --argjson opaque "$opaque_result" \
+      '{result:$result,path:$path,opaque_no_mistakes_result:$opaque}')"
     ;;
   worker.prepare)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
     repo_name=$(jq -r '.repository_name // empty' "$REQUEST_FILE")
     kind=$(jq -r '.kind // "ship"' "$REQUEST_FILE")
     mode=$(jq -r '.mode // empty' "$REQUEST_FILE")
+    opaque_record="$FM_HOME/data/$task_id/q-opaque-no-mistakes.json"
+    opaque_ready="$opaque_record.ready"
+    opaque_enabled=false
+    opaque_reused=false
+    if jq -e '.worker_contract.opaque_no_mistakes != null' "$REQUEST_FILE" >/dev/null 2>&1; then
+      opaque_enabled=true
+      if ! jq -e '
+          .kind == "ship" and .mode == "no-mistakes" and
+          .worker_contract.phase == "implementation" and
+          .worker_contract.disposition == "changeset" and
+          .worker_contract.delivery_mode == "no_mistakes_pr" and
+          .worker_contract.completion_mode == "opaque_firstmate_no_mistakes" and
+          (.worker_contract.permitted_actions | index("run_no_mistakes")) != null and
+          .worker_contract.opaque_no_mistakes.schema ==
+            "q.opaque-no-mistakes-instruction.v1" and
+          .worker_contract.opaque_no_mistakes.root_task_id ==
+            .worker_contract.root_task_id and
+          .worker_contract.opaque_no_mistakes.execution_generation ==
+            .worker_contract.execution_generation and
+          .worker_contract.opaque_no_mistakes.selected_custodian == .task_id and
+          .worker_contract.opaque_no_mistakes.delivery_mode == "no_mistakes_pr" and
+          .worker_contract.opaque_no_mistakes.provider_governance ==
+            "ungoverned_opt_in" and
+          (.worker_contract.opaque_no_mistakes.risk_acceptance_sha256 |
+            test("^[0-9a-f]{64}$")) and
+          (.worker_contract.opaque_no_mistakes.intent_sha256 |
+            test("^[0-9a-f]{64}$"))
+        ' "$REQUEST_FILE" >/dev/null; then
+        respond refused null '"invalid opaque no-mistakes worker contract"' null
+        exit 2
+      fi
+      if [ -f "$opaque_record" ]; then
+        requested=$(jq -S -c '.worker_contract.opaque_no_mistakes' "$REQUEST_FILE")
+        recorded=$(jq -S -c . "$opaque_record" 2>/dev/null || true)
+        if [ "$requested" != "$recorded" ]; then
+          respond conflict null '"opaque operation identity was reused with different bytes"' \
+            '"preserve the recorded operation and reconcile the caller"'
+          exit 3
+        fi
+        opaque_reused=true
+        brief="$FM_HOME/data/$task_id/brief.md"
+        if [ -f "$brief" ] && [ -f "$opaque_ready" ] && \
+           [ "$(sha256_file "$brief")" = "$(cat "$opaque_ready")" ]; then
+          respond ok "$(jq -cn --arg brief "$brief" --arg record "$opaque_record" \
+            '{brief_path:$brief,opaque_acceptance_path:$record,reused:true}')"
+          exit 0
+        fi
+      fi
+    fi
     if [ "$(jq -r .schema "$REQUEST_FILE")" = q.firstmate-request.v2 ]; then
       python3 - "$REQUEST_FILE" <<'PY'
 import json
@@ -465,17 +690,37 @@ PY
           .result_contract.primary_output.artifact_id ==
             .worker_contract.output_artifact_ids[0] and
           .result_contract.primary_output.kind == "report"
-        end)
+        end) and
+        ((.worker_contract.opaque_no_mistakes == null) or
+         (.result_contract.opaque_no_mistakes.schema ==
+            "q.opaque-no-mistakes-claim.v1" and
+          .result_contract.opaque_no_mistakes.opaque_operation_id ==
+            .worker_contract.opaque_no_mistakes.opaque_operation_id and
+          .result_contract.opaque_no_mistakes.risk_acceptance_id ==
+            .worker_contract.opaque_no_mistakes.risk_acceptance_id and
+          .result_contract.opaque_no_mistakes.risk_acceptance_sha256 ==
+            .worker_contract.opaque_no_mistakes.risk_acceptance_sha256))
       ' "$REQUEST_FILE" >/dev/null; then
       respond refused null '"invalid v2 worker preparation contract"' null
       exit 2
     fi
-    case "$kind" in
-      ship) run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-brief.sh" "$task_id" "$repo_name" --mode "$mode" || exit $? ;;
-      scout) run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-brief.sh" "$task_id" "$repo_name" --scout || exit $? ;;
-      *) respond refused null '"worker kind must be ship or scout"' null; exit 2 ;;
-    esac
+    if [ "$opaque_reused" = true ] && [ -f "$FM_HOME/data/$task_id/brief.md" ]; then
+      :
+    else
+      case "$kind" in
+        ship) run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-brief.sh" "$task_id" "$repo_name" --mode "$mode" || exit $? ;;
+        scout) run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-brief.sh" "$task_id" "$repo_name" --scout || exit $? ;;
+        *) respond refused null '"worker kind must be ship or scout"' null; exit 2 ;;
+      esac
+    fi
     brief="$FM_HOME/data/$task_id/brief.md"
+    if [ "$opaque_enabled" = true ] && [ ! -f "$opaque_record" ]; then
+      mkdir -p "$(dirname "$opaque_record")"
+      opaque_tmp=$(mktemp "$FM_HOME/data/$task_id/.q-opaque.XXXXXX")
+      jq -S '.worker_contract.opaque_no_mistakes' "$REQUEST_FILE" >"$opaque_tmp"
+      chmod 600 "$opaque_tmp"
+      mv "$opaque_tmp" "$opaque_record"
+    fi
     python3 - "$REQUEST_FILE" "$brief" <<'PY'
 import json
 import os
@@ -486,18 +731,30 @@ with open(request_path, encoding="utf-8") as stream:
     request = json.load(stream)
 with open(brief_path, encoding="utf-8") as stream:
     brief = stream.read()
+override_marker = "<!-- q-completion-override:v2 -->"
+if override_marker in brief:
+    brief = brief.split(override_marker, 1)[0].rstrip() + "\n"
 brief = brief.replace("{TASK}", request["captain_intent"])
 brief = brief.replace("{FIRSTMATE_SPEC}", request["execution_spec"])
-brief += "\n## Quartermaster completion override\n\n"
+contract = request.get("worker_contract", {})
+result_contract = request.get("result_contract", {})
+brief += "\n" + override_marker + "\n## Quartermaster completion override\n\n"
 brief += "This is a Q-managed worker. The machine-readable q-result.json below is the "
 brief += "sole completion handoff. Do not call captain-hold, tasks-axi, delivery, teardown, "
 brief += "or a Firstmate completion gate. Do not mark the work blocked merely because those "
 brief += "tools are absent. Set outcome from the assigned task itself, atomically publish the "
 brief += "typed result, and then stop.\n"
-brief += "Do not call no-mistakes; Quartermaster owns any separate validation.\n"
+opaque = contract.get("opaque_no_mistakes")
+if opaque:
+    brief += "The operator explicitly accepted the ungoverned compatibility path for this "
+    brief += "one task. Run the ordinary no-mistakes workflow to a terminal outcome before "
+    brief += "publishing q-result.json. Never pass --yes or -y and never merge. Record only "
+    brief += "the structured claimed outcome and optional native run ID in the allocated "
+    brief += "q.opaque-no-mistakes-claim.v1 field. Q will independently observe the final "
+    brief += "worktree and PR head and does not attest provider internals or shutdown.\n"
+else:
+    brief += "Do not call no-mistakes; Quartermaster owns any separate validation.\n"
 publication = request.get("worker_contract", {}).get("publication_directory")
-contract = request.get("worker_contract", {})
-result_contract = request.get("result_contract", {})
 if publication and result_contract.get("artifact_manifest_id"):
     brief += "The Quartermaster artifact publication directory `" + publication + "` is an "
     brief += "additional permitted write location for the declared artifacts and manifest; "
@@ -537,7 +794,18 @@ with open(temporary, "w", encoding="utf-8") as stream:
     stream.write(brief)
 os.replace(temporary, brief_path)
 PY
-    respond ok "$(jq -cn --arg brief "$brief" '{brief_path:$brief}')"
+    if [ "$opaque_enabled" = true ]; then
+      opaque_ready_tmp=$(mktemp "$FM_HOME/data/$task_id/.q-opaque-ready.XXXXXX")
+      sha256_file "$brief" >"$opaque_ready_tmp" || {
+        rm -f "$opaque_ready_tmp"
+        respond error null '"SHA-256 tool is unavailable for opaque acceptance"' null
+        exit 1
+      }
+      chmod 600 "$opaque_ready_tmp"
+      mv "$opaque_ready_tmp" "$opaque_ready"
+    fi
+    respond ok "$(jq -cn --arg brief "$brief" --argjson reused "$opaque_reused" \
+      '{brief_path:$brief,reused:$reused}')"
     ;;
   worker.spawn)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
@@ -774,6 +1042,40 @@ PY
     root_task_id=$(jq -r '.root_task_id // empty' "$REQUEST_FILE")
     captain_intent=$(jq -r '.captain_intent // empty' "$REQUEST_FILE")
     execution_spec=$(jq -r '.execution_spec // empty' "$REQUEST_FILE")
+    opaque_supervision=false
+    if jq -e '.worker_contract.opaque_no_mistakes != null' "$REQUEST_FILE" >/dev/null 2>&1; then
+      opaque_supervision=true
+      if ! jq -e '
+          .schema == "q.firstmate-request.v2" and
+          .worker_contract.schema == "q.worker-contract.v2" and
+          .worker_contract.phase == "supervision" and
+          .worker_contract.disposition == "changeset" and
+          .worker_contract.delivery_mode == "no_mistakes_pr" and
+          .worker_contract.completion_mode == "opaque_firstmate_no_mistakes" and
+          .worker_contract.opaque_no_mistakes.schema ==
+            "q.opaque-no-mistakes-instruction.v1" and
+          .worker_contract.opaque_no_mistakes.root_task_id == .root_task_id
+        ' "$REQUEST_FILE" >/dev/null; then
+        respond refused null '"invalid opaque no-mistakes supervisor contract"' null
+        exit 2
+      fi
+      mkdir -p "$supervisor_home/data/q-opaque-no-mistakes"
+      supervisor_opaque="$supervisor_home/data/q-opaque-no-mistakes/$root_task_id.json"
+      requested=$(jq -S -c '.worker_contract.opaque_no_mistakes' "$REQUEST_FILE")
+      if [ -f "$supervisor_opaque" ]; then
+        recorded=$(jq -S -c . "$supervisor_opaque" 2>/dev/null || true)
+        if [ "$requested" != "$recorded" ]; then
+          respond conflict null '"opaque supervisor operation changed on replay"' \
+            '"preserve the recorded operation and reconcile the caller"'
+          exit 3
+        fi
+      else
+        supervisor_opaque_tmp=$(mktemp "$supervisor_home/data/q-opaque-no-mistakes/.accept.XXXXXX")
+        jq -S '.worker_contract.opaque_no_mistakes' "$REQUEST_FILE" >"$supervisor_opaque_tmp"
+        chmod 600 "$supervisor_opaque_tmp"
+        mv "$supervisor_opaque_tmp" "$supervisor_opaque"
+      fi
+    fi
     case "$supervisor_home" in /*) ;; *) respond refused null '"supervisor_home must be absolute"' null; exit 2 ;; esac
     case "$project_name" in ''|*[!A-Za-z0-9._-]*) respond refused null '"invalid supervisor project name"' null; exit 2 ;; esac
     [ -d "$FM_HOME/projects/$project_name" ] || {
@@ -785,8 +1087,13 @@ PY
       respond ok "$(jq -cn --arg home "$supervisor_home" --arg events "$supervisor_home/state/q-supervisor-events.jsonl" '{supervisor_home:$home,events_path:$events,reused:true}')"
       exit 0
     fi
+    if [ "$opaque_supervision" = true ]; then
+      dependency_rule="This is an explicitly accepted ungoverned no-mistakes compatibility run. Select exactly one implementation child as final custodian. Stop or preserve every nonselected child before instructing only that selected custodian to complete the ordinary no-mistakes workflow. Never pass --yes or -y, never answer a no-mistakes question automatically, and never merge. The selected child's final q.worker-result.v3 must include the exact q.opaque-no-mistakes-claim.v1 identity from this charter."
+    else
+      dependency_rule="This is a Q-managed local-only supervision run. Q is the lifecycle owner and its spawn guard is already wired transparently into Firstmate. Do not require or install gh-axi, chrome-devtools-axi, lavish-axi, tasks-axi, quota-axi, no-mistakes, GitHub authentication, delivery tooling, or production credentials; they are outside this charter and their absence is not a blocker."
+    fi
     charter=$(printf '%s\n\n%s\n\n%s\n' "$captain_intent" "$execution_spec" \
-      "This is a Q-managed local-only supervision run. Q is the lifecycle owner and its spawn guard is already wired transparently into Firstmate. Do not require or install gh-axi, chrome-devtools-axi, lavish-axi, tasks-axi, quota-axi, no-mistakes, GitHub authentication, delivery tooling, or production credentials; they are outside this charter and their absence is not a blocker. Use ordinary Firstmate brief/spawn operations for only the children justified by the task, and let the wired Q guard accept or deny each lease. Never promote or relaunch an investigation child to perform implementation; a child's authorized phase is immutable. After a nonselected investigation child publishes a valid completed q.worker-result.v2, or after a child fails and safe cleanup succeeds, invoke bin/fm-api.sh worker.cleanup with a strict q.firstmate-request.v1 request instead of calling fm-teardown.sh directly; this is how Q is told that the stopped child no longer consumes concurrency. Never clean up selected completed implementation work before Q ingests its typed result. Do not request a user decision merely to bypass ordinary Firstmate completion conventions. Write only q.supervisor-event.v1 JSON objects, one per line with consecutive sequence numbers, to state/q-supervisor-events.jsonl. The exact shape is {\"schema\":\"q.supervisor-event.v1\",\"sequence\":1,\"event\":\"accepted\",\"root_task_id\":\"$root_task_id\",\"message\":\"concise summary\",\"data\":{}}; the field is named event, never state. Every event must carry root_task_id=$root_task_id. Use accepted, child_proposed, child_lease_denied, decision_required, blocked, validation_ready, delivery_ready, failed, or completed. A validation_ready, delivery_ready, or completed event must put the selected child's complete q.worker-result.v2 object in data.result and its durable Firstmate id in data.external_task_id. Obtain that result through the facade; never reconstruct worktree or revision identity. Q alone authorizes child leases, budgets, validation, and delivery.")
+      "$dependency_rule Use ordinary Firstmate brief/spawn operations for only the children justified by the task, and let the wired Q guard accept or deny each lease. Never promote or relaunch an investigation child to perform implementation; a child's authorized phase is immutable. After a nonselected investigation child publishes a valid completed q.worker-result.v2, or after a child fails and safe cleanup succeeds, invoke bin/fm-api.sh worker.cleanup with a strict q.firstmate-request.v1 request instead of calling fm-teardown.sh directly; this is how Q is told that the stopped child no longer consumes concurrency. Never clean up selected completed implementation work before Q ingests its typed result. Do not request a user decision merely to bypass ordinary Firstmate completion conventions. Write only q.supervisor-event.v1 JSON objects, one per line with consecutive sequence numbers, to state/q-supervisor-events.jsonl. The exact shape is {\"schema\":\"q.supervisor-event.v1\",\"sequence\":1,\"event\":\"accepted\",\"root_task_id\":\"$root_task_id\",\"message\":\"concise summary\",\"data\":{}}; the field is named event, never state. Every event must carry root_task_id=$root_task_id. Use accepted, child_proposed, child_lease_denied, decision_required, blocked, validation_ready, delivery_ready, failed, or completed. A validation_ready, delivery_ready, or completed event must put the selected child's complete q.worker-result.v3 object in data.result and its durable Firstmate id in data.external_task_id. Obtain that result through the facade; never reconstruct worktree or revision identity. Q alone authorizes child leases, budgets, validation, and delivery.")
     run_owner env FM_HOME="$FM_HOME" FM_SECONDMATE_CHARTER="$charter" \
       FM_SECONDMATE_SCOPE="Quartermaster root $root_task_id only." \
       "$SCRIPT_DIR/fm-home-seed.sh" "$task_id" "$supervisor_home" "$project_name" || exit $?
@@ -942,6 +1249,58 @@ PY
     cat "$control_err" >&2
     rm -f "$control_out" "$control_err"
     respond ok "$(supervisor_stop_evidence false)"
+    ;;
+  delivery.inspect)
+    task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    mode=$(jq -r '.mode // empty' "$REQUEST_FILE")
+    [ "$mode" = no-mistakes ] || {
+      respond refused null '"typed PR inspection supports no-mistakes delivery only"' null
+      exit 2
+    }
+    meta="$FM_HOME/state/$task_id.meta"
+    [ -f "$meta" ] || { respond refused null '"worker metadata is missing"' null; exit 3; }
+    worktree=$(sed -n 's/^worktree=//p' "$meta")
+    [ -n "$worktree" ] && [ -d "$worktree" ] || {
+      respond refused null '"worker worktree is unavailable"' null
+      exit 3
+    }
+    pr_url=$(sed -n 's/^pr=//p' "$meta" | tail -n 1)
+    if [ -z "$pr_url" ] && [ -f "$FM_HOME/state/$task_id.status" ]; then
+      pr_url=$(sed -n 's/.*[[:space:]]pr=\(https:[^[:space:]]*\).*/\1/p' \
+        "$FM_HOME/state/$task_id.status" | tail -n 1)
+    fi
+    gh_target=()
+    [ -z "$pr_url" ] || gh_target=("$pr_url")
+    pr_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-api-pr.XXXXXX")
+    if ! git -C "$worktree" status --porcelain=v1 >/dev/null 2>&1 || \
+       ! gh pr view "${gh_target[@]}" \
+          --json url,number,baseRefName,headRefOid,state,isDraft,mergeStateStatus,statusCheckRollup \
+          >"$pr_tmp" 2>/dev/null; then
+      rm -f "$pr_tmp"
+      respond refused null '"canonical PR observation is unavailable"' \
+        '"retain the worktree and restore authenticated forge observation"'
+      exit 3
+    fi
+    repo_name=$(git -C "$worktree" remote get-url origin 2>/dev/null || true)
+    observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    observation=$(jq -c --arg repository "$repo_name" --arg observed "$observed_at" '
+      def conclusion:
+        (.conclusion // .state // .status // "UNKNOWN") | ascii_upcase;
+      .statusCheckRollup as $checks |
+      (($checks // []) | map(conclusion)) as $states |
+      {schema:"fm.pr-observation.v1",repository:$repository,url:.url,number:.number,
+       base:.baseRefName,state:(.state | ascii_downcase),head:.headRefOid,
+       is_draft:.isDraft,merge_state:(.mergeStateStatus | ascii_downcase),
+       checks:($checks // []),
+       checks_state:(if (($states | length) == 0 or
+                         all($states[]; . == "SUCCESS" or . == "SKIPPED" or
+                           . == "NEUTRAL")) then "green"
+                     elif any($states[]; . == "FAILURE" or . == "ERROR" or
+                           . == "CANCELLED" or . == "TIMED_OUT") then "failed"
+                     else "pending" end),observed_at:$observed}
+    ' "$pr_tmp")
+    rm -f "$pr_tmp"
+    respond ok "$(jq -cn --argjson pr "$observation" '{pr_observation:$pr}')"
     ;;
   delivery.execute)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")

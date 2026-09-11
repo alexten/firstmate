@@ -126,7 +126,15 @@ test_capabilities_are_one_versioned_json_object() {
     .postcondition_evidence.q_spawn_guard == true and
     (.postcondition_evidence.request_schemas | index("q.firstmate-request.v2")) != null and
     .postcondition_evidence.retirement_receipts == true and
-    .postcondition_evidence.artifact_publication == true
+    .postcondition_evidence.artifact_publication == true and
+    .postcondition_evidence.typed_pr_observation == true and
+    .postcondition_evidence.opaque_no_mistakes == {
+      schema:"fm.opaque-no-mistakes.v1",supported:true,
+      delivery_modes:["no_mistakes_pr"],final_result:true,
+      final_head_observation:true,worker_stop_observation:true,
+      native_hard_bounds:false,provider_events:false,
+      provider_attestation:false,provider_retirement:false
+    }
   ' >/dev/null \
     || fail "capabilities response shape is invalid"
   pass "capabilities returns one versioned JSON object"
@@ -208,6 +216,117 @@ test_v2_investigation_prepares_without_artifact_publication() {
   grep -F '"kind": "summary"' "$HOME_ROOT/data/worker-investigation/brief.md" >/dev/null \
     || fail "v2 investigation did not render the inline handoff contract"
   pass "v2 investigation prepares without fake artifact publication"
+}
+
+test_opaque_no_mistakes_is_idempotent_and_returns_typed_observation() {
+  local id=worker-opaque root=task-opaque execution=worker-opaque
+  local risk_sha intent_sha request out changed worktree head first_opaque replay_request
+  local replayed_opaque
+  risk_sha=$(printf risk | sha256sum | cut -d' ' -f1)
+  intent_sha=$(printf intent | sha256sum | cut -d' ' -f1)
+  request=$(jq -cn --arg result_path "$HOME_ROOT/data/$id/q-result.json" \
+    --arg risk_sha "$risk_sha" --arg intent_sha "$intent_sha" \
+    --arg id "$id" --arg root "$root" \
+    '{schema:"q.firstmate-request.v2",operation:"worker.prepare",
+      idempotency_key:"opaque-prepare",task_id:$id,repository_name:"repo",
+      kind:"ship",mode:"no-mistakes",captain_intent:"Fix the authorization defect.",
+      execution_spec:"Complete the accepted opaque workflow.",result_path:$result_path,
+      worker_contract:{schema:"q.worker-contract.v2",root_task_id:$root,
+        execution_id:$id,execution_generation:1,phase:"implementation",disposition:"changeset",
+        delivery_mode:"no_mistakes_pr",completion_mode:"opaque_firstmate_no_mistakes",
+        permitted_actions:["mutate_source","commit","run_no_mistakes","publish_pr"],
+        output_manifest_id:null,output_artifact_ids:[],publication_directory:null,
+        opaque_no_mistakes:{schema:"q.opaque-no-mistakes-instruction.v1",
+          opaque_operation_id:"opaque-operation-1",risk_acceptance_id:"risk-1",
+          risk_acceptance_sha256:$risk_sha,root_task_id:$root,
+          execution_generation:1,selected_custodian:$id,intent_sha256:$intent_sha,
+          repository:"/repo",base_revision:"1111111111111111111111111111111111111111",
+          delivery_mode:"no_mistakes_pr",provider_governance:"ungoverned_opt_in"}},
+      result_contract:{schema:"q.worker-result.v3",root_task_id:$root,execution_id:$id,
+        artifact_manifest_id:null,primary_output:{kind:"changeset",artifact_id:null},
+        opaque_no_mistakes:{schema:"q.opaque-no-mistakes-claim.v1",
+          opaque_operation_id:"opaque-operation-1",risk_acceptance_id:"risk-1",
+          risk_acceptance_sha256:$risk_sha,outcome:"passed|failed|cancelled|blocked|unknown",
+          native_run_id:null}}}')
+  out=$(invoke worker.prepare "$request") || fail "opaque worker.prepare failed"
+  printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null \
+    || fail "opaque preparation response failed"
+  grep -F 'Run the ordinary no-mistakes workflow' "$HOME_ROOT/data/$id/brief.md" >/dev/null \
+    || fail "opaque brief did not authorize the ordinary workflow"
+  grep -F 'Do not call no-mistakes' "$HOME_ROOT/data/$id/brief.md" >/dev/null \
+    && fail "opaque brief retained the ordinary Q prohibition"
+  out=$(invoke worker.prepare "$request") || fail "identical opaque preparation did not replay"
+  printf '%s\n' "$out" | jq -e '.postcondition_evidence.reused == true' >/dev/null \
+    || fail "opaque preparation replay was not identified"
+  rm "$HOME_ROOT/data/$id/q-opaque-no-mistakes.json.ready"
+  out=$(invoke worker.prepare "$request") \
+    || fail "lost opaque preparation acknowledgement did not reconcile"
+  [ "$(grep -Fc '<!-- q-completion-override:v2 -->' "$HOME_ROOT/data/$id/brief.md")" -eq 1 ] \
+    || fail "opaque acknowledgement recovery duplicated the worker instruction"
+  [ -f "$HOME_ROOT/data/$id/q-opaque-no-mistakes.json.ready" ] \
+    || fail "opaque acknowledgement recovery did not republish readiness"
+  changed=$(jq '.worker_contract.opaque_no_mistakes.intent_sha256 =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' <<<"$request")
+  out=$(invoke worker.prepare "$changed")
+  [ "$?" -eq 3 ] || fail "changed opaque operation bytes did not conflict"
+  printf '%s\n' "$out" | jq -e '.result == "conflict"' >/dev/null \
+    || fail "opaque replay conflict was not typed"
+
+  worktree="$HOME_ROOT/worktree-$id"
+  mkdir -p "$worktree"
+  git -C "$worktree" init -q
+  git -C "$worktree" config user.name Test
+  git -C "$worktree" config user.email test@example.invalid
+  printf 'fixed\n' >"$worktree/file.txt"
+  git -C "$worktree" add file.txt
+  git -C "$worktree" commit -qm fixed
+  head=$(git -C "$worktree" rev-parse HEAD)
+  printf '%s\n' "q_root_task_id=$root" "q_execution_id=$execution" \
+    'q_phase=implementation' 'spawn_gen=s1.fixture' "worktree=$worktree" \
+    >"$HOME_ROOT/state/$id.meta"
+  jq -cn --arg root "$root" --arg execution "$execution" --arg worktree "$worktree" \
+    --arg head "$head" --arg risk_sha "$risk_sha" \
+    '{schema:"q.worker-result.v3",root_task_id:$root,execution_id:$execution,
+      execution_generation:1,result_generation:1,outcome:"completed",summary:"done",
+      artifacts:[],investigation_report:null,usage:[],evidence:[],
+      observed_repository:"/repo",observed_revision:$head,worktree:$worktree,
+      branch:"main",completed_at:"2026-09-11T00:00:00Z",finality:"final",
+      disposition:"changeset",primary_output:{kind:"changeset",title:"Fix",
+        media_type:null,artifact_id:null,completeness:"complete"},
+      artifact_manifest_id:null,supersedes_result_id:null,validation_binding:null,
+      opaque_no_mistakes:{schema:"q.opaque-no-mistakes-claim.v1",
+        opaque_operation_id:"opaque-operation-1",risk_acceptance_id:"risk-1",
+        risk_acceptance_sha256:$risk_sha,outcome:"passed",native_run_id:"nm-1"}}' \
+    >"$HOME_ROOT/data/$id/q-result.json"
+  request=$(jq -cn --arg id "$id" \
+    '{schema:"q.firstmate-request.v2",operation:"worker.result",
+      idempotency_key:"opaque-result",task_id:$id,include_opaque_no_mistakes:true}')
+  out=$(invoke worker.result "$request") || fail "opaque worker.result failed"
+  printf '%s\n' "$out" | jq -e --arg head "$head" '
+    .postcondition_evidence.opaque_no_mistakes_result as $opaque |
+    $opaque.schema == "fm.opaque-no-mistakes-result.v1" and
+    $opaque.opaque_operation_id == "opaque-operation-1" and
+    $opaque.claimed_no_mistakes_outcome == "passed" and
+    $opaque.observed_final_head == $head and $opaque.worker_state == "stopped" and
+    (($opaque.limitations | index("provider_shutdown_not_provable")) != null)
+  ' >/dev/null || fail "opaque terminal observation is invalid"
+  first_opaque=$(printf '%s\n' "$out" | jq -S -c \
+    '.postcondition_evidence.opaque_no_mistakes_result')
+  replay_request=$(jq '.idempotency_key = "opaque-result-replay"' <<<"$request")
+  out=$(invoke worker.result "$replay_request") \
+    || fail "identical opaque terminal result did not replay"
+  replayed_opaque=$(printf '%s\n' "$out" | jq -S -c \
+    '.postcondition_evidence.opaque_no_mistakes_result')
+  [ "$first_opaque" = "$replayed_opaque" ] \
+    || fail "opaque terminal replay changed the recorded bytes"
+  jq '.summary = "changed after terminal publication"' \
+    "$HOME_ROOT/data/$id/q-result.json" >"$HOME_ROOT/data/$id/q-result.changed"
+  mv "$HOME_ROOT/data/$id/q-result.changed" "$HOME_ROOT/data/$id/q-result.json"
+  out=$(invoke worker.result "$replay_request")
+  [ "$?" -eq 3 ] || fail "changed opaque terminal bytes did not conflict"
+  printf '%s\n' "$out" | jq -e '.result == "conflict"' >/dev/null \
+    || fail "changed opaque terminal result conflict was not typed"
+  pass "opaque no-mistakes instruction is idempotent and terminal evidence stays ungoverned"
 }
 
 test_worker_result_validates_durable_identity() {
@@ -655,6 +774,52 @@ EOF
   pass "Q guard propagates child identity and releases an aborted launch"
 }
 
+test_q_guard_records_the_selected_opaque_custodian_before_brief_delivery() {
+  local fake_q="$TMP_ROOT/fake-q-opaque" data="$TMP_ROOT/q-opaque-child-data"
+  local risk_sha
+  risk_sha=$(printf risk | sha256sum | cut -d' ' -f1)
+  cat >"$fake_q" <<EOF
+#!/usr/bin/env bash
+set -eu
+cat >/dev/null
+printf '%s\n' '{"schema":"q.guard-authorization.v1","result":"authorized","root_task_id":"task-root","parent_execution_id":"exec-parent","execution_id":"exec-selected","external_task_id":"selected-child","requested_depth":1,"lease_id":"lease-selected","lease_state":"reserved","denial_reason":null,"result_contract":{"schema":"q.worker-result.v3","root_task_id":"task-root","execution_id":"exec-selected","outcome":"completed | failed | blocked","summary":"string","artifacts":[],"investigation_report":null,"usage":[],"evidence":[],"observed_repository":"/repo","observed_revision":"git rev-parse HEAD after the final commit","worktree":"pwd -P","branch":"git branch --show-current, or null when detached","completed_at":"RFC3339 timestamp","execution_generation":1,"result_generation":1,"finality":"candidate|final|partial","disposition":"changeset","primary_output":{"kind":"changeset","title":"result","media_type":null,"artifact_id":null,"completeness":"complete"},"artifact_manifest_id":null,"opaque_no_mistakes":{"schema":"q.opaque-no-mistakes-claim.v1","opaque_operation_id":"opaque-one","risk_acceptance_id":"risk-one","risk_acceptance_sha256":"$risk_sha","outcome":"passed|failed|cancelled|blocked|unknown","native_run_id":null}}}'
+EOF
+  chmod +x "$fake_q"
+  mkdir -p "$data/selected-child" "$data/q-opaque-no-mistakes"
+  printf '%s\n' 'selected child brief' >"$data/selected-child/brief.md"
+  jq -cn --arg risk_sha "$risk_sha" \
+    '{schema:"q.opaque-no-mistakes-instruction.v1",opaque_operation_id:"opaque-one",
+      risk_acceptance_id:"risk-one",risk_acceptance_sha256:$risk_sha,
+      root_task_id:"task-root",execution_generation:1,
+      selected_custodian:"pending:firstmate-selection",intent_sha256:("a" * 64),
+      repository:"/repo",base_revision:("1" * 40),delivery_mode:"no_mistakes_pr",
+      provider_governance:"ungoverned_opt_in"}' \
+    >"$data/q-opaque-no-mistakes/task-root.json"
+  # Q identity mutations are intentionally confined to this test subshell.
+  # shellcheck disable=SC2030,SC2031
+  (
+    # shellcheck source=bin/fm-q-guard-lib.sh
+    . "$BIN/fm-q-guard-lib.sh"
+    export FM_Q_MANAGED=1 FM_Q_DELEGATION_ENABLED=1 FM_Q_PREAUTHORIZED=0
+    export FM_Q_ROOT_TASK_ID=task-root FM_Q_EXECUTION_ID=exec-parent
+    export FM_Q_EXPECTED_WALL_SECONDS=300 FM_Q_CLI="$fake_q"
+    export FM_Q_DATA_DIR="$TMP_ROOT/q-data"
+    DATA="$data"
+    fm_q_guard_authorize_child selected-child ship codex model high || exit 1
+    fm_q_guard_append_child_result_contract selected-child || exit 1
+  ) || fail "opaque Q guard could not bind the selected child"
+  jq -e '
+    .schema == "fm.opaque-custodian-selection.v1" and
+    .root_task_id == "task-root" and .opaque_operation_id == "opaque-one" and
+    .execution_id == "exec-selected" and .external_task_id == "selected-child"
+  ' "$data/q-opaque-no-mistakes/task-root-selection.json" >/dev/null \
+    || fail "opaque custodian selection was not recorded exactly"
+  grep -F 'single selected implementation custodian' \
+    "$data/selected-child/brief.md" >/dev/null \
+    || fail "selected opaque custodian did not receive the bounded permission"
+  pass "Q guard records one selected opaque custodian before brief delivery"
+}
+
 test_q_guard_authorizes_each_relaunch_transaction() {
   calls="$TMP_ROOT/q-guard-retry.calls"
   fake_q="$TMP_ROOT/fake-q"
@@ -833,6 +998,7 @@ test_invalid_request_refuses_as_json
 test_prepare_delegates_and_renders_contract
 test_v2_report_worker_contract_prepares_and_spawns
 test_v2_investigation_prepares_without_artifact_publication
+test_opaque_no_mistakes_is_idempotent_and_returns_typed_observation
 test_worker_result_validates_durable_identity
 test_worker_result_accepts_v2_typed_evidence
 test_worker_result_v3_and_retirement_are_typed_and_idempotent
@@ -852,6 +1018,7 @@ test_worker_capture_resolves_recorded_endpoint_and_preserves_ansi
 test_worker_relaunch_delegates_with_q_transport
 test_q_spawn_validation_is_opt_in_and_precedes_mutation
 test_q_guard_authorizes_propagates_and_releases
+test_q_guard_records_the_selected_opaque_custodian_before_brief_delivery
 test_q_guard_authorizes_each_relaunch_transaction
 test_q_guard_reuses_facade_operation_key_across_transaction_recovery
 test_q_guard_refuses_denial_and_unavailable_contract

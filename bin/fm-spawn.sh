@@ -939,6 +939,7 @@ CONFIG_INHERIT_LOCK_HELD=0
 FM_Q_GUARD_ACQUIRED=0
 FM_Q_GUARD_COMMITTED=0
 FM_Q_GUARD_LAUNCH_DELIVERED=0
+SPAWN_UNPUBLISHED_ENDPOINT=0
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -969,6 +970,15 @@ parse_orca_worktree_result() {
 
 spawn_abort_cleanup() {
   local status=$?
+  if [ "$SPAWN_UNPUBLISHED_ENDPOINT" = 1 ]; then
+    SPAWN_UNPUBLISHED_ENDPOINT=0
+    local abort_tab_id=
+    [ "${BACKEND:-}" = zellij ] && abort_tab_id=${ZELLIJ_TAB_ID:-}
+    if ! fm_backend_kill "${BACKEND:-tmux}" "${T:-}" "$abort_tab_id" "${W:-}" \
+        2>/dev/null; then
+      echo "warning: could not remove unpublished endpoint for aborted spawn of $ID" >&2
+    fi
+  fi
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -2957,6 +2967,7 @@ EOF
     T="$ORCA_TERMINAL"
     ;;
 esac
+SPAWN_UNPUBLISHED_ENDPOINT=1
 fi
 if [ "$KIND" = secondmate ]; then
   FM_INHERITABLE_CONFIG=trace-context \
@@ -3806,6 +3817,7 @@ if [ "$RELAUNCH" -eq 0 ]; then
     exit 1
   fi
   SPAWN_META_TMP=
+  SPAWN_UNPUBLISHED_ENDPOINT=0
 fi
 
 # Fuse the backlog In-flight transition into the publication that just created

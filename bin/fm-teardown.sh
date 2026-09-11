@@ -3022,7 +3022,8 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
     if [ -n "$Q_ROOT_EXECUTION" ] && [ -z "$Q_ROOT_PARENT" ] \
        && [ "$Q_ROOT_PHASE" = investigation ] \
        && jq -e --arg execution "$Q_ROOT_EXECUTION" '
-         .schema == "q.worker-result.v2" and .execution_id == $execution and
+         (.schema == "q.worker-result.v2" or .schema == "q.worker-result.v3") and
+         .execution_id == $execution and
          .outcome == "completed"
        ' "$Q_ROOT_RESULT" >/dev/null 2>&1; then
       Q_ROOT_SCOUT_COMPLETE=1

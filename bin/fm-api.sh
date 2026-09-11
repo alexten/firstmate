@@ -317,6 +317,14 @@ if meta.get("q_phase") == "investigation":
     result["artifact_manifest_id"] = None
 
 if meta.get("harness") == "codex":
+    # Codex currently exposes structured token totals, but not structured cost.
+    # Discard worker-authored placeholders (especially cost_usd=0); absence is
+    # an honest unknown and must not be persisted as a measurement.
+    result["usage"] = [
+        item
+        for item in result.get("usage", [])
+        if item.get("metric") not in {"tokens", "cost_usd"}
+    ]
     spawn_match = re.fullmatch(r"s(\d+)\..+", meta.get("spawn_gen", ""))
     worktree = os.path.realpath(meta.get("worktree", ""))
     sessions_root = os.path.join(codex_home, "sessions")
@@ -362,9 +370,6 @@ if meta.get("harness") == "codex":
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     continue
     if matched:
-        result["usage"] = [
-            item for item in result.get("usage", []) if item.get("metric") != "tokens"
-        ]
         result["usage"].append(
             {
                 "schema": "q.usage-report.v1",
@@ -717,7 +722,7 @@ PY
       result_file="$FM_HOME/data/$task_id/q-result.json"
       if [ -f "$result_file" ]; then
         q_outcome=$(jq -r --arg execution "$q_execution" '
-          if .schema == "q.worker-result.v2" and
+        if (.schema == "q.worker-result.v2" or .schema == "q.worker-result.v3") and
              .execution_id == $execution and .outcome == "completed"
           then .outcome else empty end
         ' "$result_file" 2>/dev/null || true)
@@ -860,6 +865,44 @@ PY
     ;;
   supervisor.stop)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
+    supervisor_stop_evidence() {
+      meta="$FM_HOME/state/$task_id.meta"
+      q_root=
+      q_execution=
+      retained_home=
+      if [ -f "$meta" ]; then
+        q_root=$(sed -n 's/^q_root_task_id=//p' "$meta")
+        q_execution=$(sed -n 's/^q_execution_id=//p' "$meta")
+        retained_home=$(sed -n 's/^home=//p' "$meta")
+      fi
+      if [ -z "$q_root" ] || [ -z "$q_execution" ]; then
+        jq -cn --arg task_id "$task_id" --argjson already "$1" \
+          '{task_id:$task_id,control:"exit",confirmed:true,already_stopped:$already}'
+        return
+      fi
+      receipt_path="$FM_HOME/state/$task_id.q-supervisor-retirement-receipt.json"
+      if [ ! -f "$receipt_path" ]; then
+        observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        receipt_id="retirement-supervisor-$task_id"
+        receipt=$(jq -cn --arg id "$receipt_id" --arg root "$q_root" \
+          --arg task "$task_id" --arg execution "$q_execution" \
+          --arg home "$retained_home" --arg observed "$observed_at" \
+          '{task_id:$task,control:"exit",confirmed:true,already_stopped:false,
+            retirement_receipt_id:$id,retirement_receipt:{
+              schema:"fm.retirement-receipt.v1",root_task_id:$root,
+              execution_generation:1,operation_id:("supervisor-stop:" + $execution),
+              run_id:("supervisor:" + $task),
+              actors:[{actor_id:$task,state:"retired",role:"supervisor"}],
+              driver_state:"retired",supervisor_state:"retired",mutation_owner:"none",
+              retained_work_locations:(if $home == "" then [] else [$home] end),
+              observation_daemon:null,observed_at:$observed}}')
+        receipt_tmp=$(mktemp "$FM_HOME/state/.$task_id.q-supervisor-retirement.XXXXXX")
+        printf '%s\n' "$receipt" >"$receipt_tmp"
+        chmod 600 "$receipt_tmp"
+        mv "$receipt_tmp" "$receipt_path"
+      fi
+      jq --argjson already "$1" '.already_stopped = $already' "$receipt_path"
+    }
     run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-fleet-snapshot.sh" --json || exit $?
     task=$(jq -c --arg id "$task_id" '[.tasks[] | select(.id == $id)][0] // null' "$OWNER_OUT")
     if [ "$task" = null ] || jq -e '
@@ -867,7 +910,7 @@ PY
         (.endpoint.agent_alive // "not_checked") == "dead" or
         (.current_state.state == "done" or .current_state.state == "failed")
       ' >/dev/null 2>&1 <<<"$task"; then
-      respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true,already_stopped:true}')"
+      respond ok "$(supervisor_stop_evidence true)"
       exit 0
     fi
     control_out=$(mktemp "${TMPDIR:-/tmp}/fm-api-control-out.XXXXXX")
@@ -887,7 +930,7 @@ PY
             (.current_state.state == "done" or .current_state.state == "failed")
           ' >/dev/null 2>&1 <<<"$task"; then
           rm -f "$control_out" "$control_err"
-          respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true,already_stopped:true}')"
+          respond ok "$(supervisor_stop_evidence true)"
           exit 0
         fi
       fi
@@ -898,12 +941,59 @@ PY
     fi
     cat "$control_err" >&2
     rm -f "$control_out" "$control_err"
-    respond ok "$(jq -cn --arg task_id "$task_id" '{task_id:$task_id,control:"exit",confirmed:true}')"
+    respond ok "$(supervisor_stop_evidence false)"
     ;;
   delivery.execute)
     task_id=$(jq -r '.task_id // empty' "$REQUEST_FILE")
     action=$(jq -r '.action // empty' "$REQUEST_FILE")
     mode=$(jq -r '.mode // empty' "$REQUEST_FILE")
+    if [ "$(jq -r '.schema' "$REQUEST_FILE")" = q.firstmate-request.v2 ] && \
+        jq -e '.local_landing != null' "$REQUEST_FILE" >/dev/null; then
+      if ! jq -e '
+          .action == "land" and .mode == "local-only" and
+          (.local_landing | type == "object") and
+          (.local_landing.root_task_id | type == "string" and length > 0) and
+          (.local_landing.repository | type == "string" and startswith("/")) and
+          (.local_landing.worktree | type == "string" and startswith("/")) and
+          (.local_landing.starting_revision | test("^[0-9a-f]{40}$")) and
+          (.local_landing.validated_revision | test("^[0-9a-f]{40}$")) and
+          (.local_landing.supervisor_child | type == "boolean") and
+          .local_landing.authority == "trusted_user_config"
+        ' "$REQUEST_FILE" >/dev/null; then
+        respond refused null '"invalid automatic local-landing contract"' null
+        exit 2
+      fi
+      root_task_id=$(jq -r '.local_landing.root_task_id' "$REQUEST_FILE")
+      repository=$(jq -r '.local_landing.repository' "$REQUEST_FILE")
+      worktree=$(jq -r '.local_landing.worktree' "$REQUEST_FILE")
+      starting_revision=$(jq -r '.local_landing.starting_revision' "$REQUEST_FILE")
+      validated_revision=$(jq -r '.local_landing.validated_revision' "$REQUEST_FILE")
+      supervisor_child=$(jq -r '.local_landing.supervisor_child' "$REQUEST_FILE")
+      worker_home=$FM_HOME
+      if [ "$supervisor_child" = true ]; then
+        supervisor_home_record="$FM_HOME/state/q-supervisor-home"
+        [ -f "$supervisor_home_record" ] || {
+          respond refused null '"supervised child home is unavailable"' null
+          exit 3
+        }
+        worker_home=$(cat "$supervisor_home_record")
+      fi
+      run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-q-land-local.sh" \
+        "$task_id" "$worker_home" "$repository" "$worktree" \
+        "$starting_revision" "$validated_revision" "$root_task_id" || exit $?
+      evidence=$(cat "$OWNER_OUT")
+      if ! jq -e '
+          .confirmed == true and
+          (.destination | type == "string") and
+          (.observed_head | test("^[0-9a-f]{40}$")) and
+          (.already_landed | type == "boolean")
+        ' >/dev/null 2>&1 <<<"$evidence"; then
+        respond error null '"local landing owner returned invalid evidence"' null
+        exit 1
+      fi
+      respond ok "$evidence"
+      exit 0
+    fi
     case "$action:$mode" in
       land:local-only)
         run_owner env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-merge-local.sh" "$task_id" || exit $?

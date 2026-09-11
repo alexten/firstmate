@@ -102,6 +102,13 @@ printf 'owner diagnostic\n' >&2
 exit 0
 EOF
 done
+cat >"$BIN/fm-q-land-local.sh" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$@" >"$FM_HOME/state/q-local-land-argv"
+jq -cn --arg destination "$3" --arg head "$6" \
+  '{confirmed:true,destination:$destination,observed_head:$head,already_landed:false}'
+EOF
 chmod +x "$BIN"/*.sh
 
 invoke() {
@@ -321,7 +328,7 @@ test_codex_worker_result_waits_for_and_reports_structured_usage() {
     "worktree=$HOME_ROOT/worktree-codex-usage" \
     >"$HOME_ROOT/state/$worker.meta"
   printf '%s\n' \
-    '{"schema":"q.worker-result.v3","root_task_id":"task-codex-usage","execution_id":"exec-codex-usage","execution_generation":1,"result_generation":1,"outcome":"completed","summary":"Investigation complete.","artifacts":[],"investigation_report":null,"usage":[],"evidence":[],"observed_repository":"/repo","observed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-10T00:00:00Z","finality":"final","disposition":"report_only","primary_output":{"kind":"summary","title":"Investigation handoff","media_type":null,"artifact_id":null,"completeness":"complete"},"artifact_manifest_id":null,"supersedes_result_id":null,"validation_binding":null}' \
+    '{"schema":"q.worker-result.v3","root_task_id":"task-codex-usage","execution_id":"exec-codex-usage","execution_generation":1,"result_generation":1,"outcome":"completed","summary":"Investigation complete.","artifacts":[],"investigation_report":null,"usage":[{"schema":"q.usage-report.v1","metric":"tokens","amount":999,"source":"worker guess"},{"schema":"q.usage-report.v1","metric":"cost_usd","amount":0,"source":"worker did not receive a harness cost observation"}],"evidence":[],"observed_repository":"/repo","observed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","worktree":"/tmp/work","branch":null,"completed_at":"2026-09-10T00:00:00Z","finality":"final","disposition":"report_only","primary_output":{"kind":"summary","title":"Investigation handoff","media_type":null,"artifact_id":null,"completeness":"complete"},"artifact_manifest_id":null,"supersedes_result_id":null,"validation_binding":null}' \
     >"$HOME_ROOT/data/$worker/q-result.json"
   request='{"schema":"q.firstmate-request.v2","operation":"worker.result","idempotency_key":"result-codex-usage-pending","task_id":"worker-codex-usage"}'
   out=$(printf '%s\n' "$request" | CODEX_HOME="$codex_home" FM_HOME="$HOME_ROOT" \
@@ -489,7 +496,7 @@ test_q_root_investigation_cleanup_leaves_settlement_to_q() {
   printf '%s\n' 'q_root_task_id=task-root' 'q_execution_id=exec-root-scout' \
     'q_lease_id=lease-root-scout' 'q_phase=investigation' \
     >"$home/state/root-scout.meta"
-  printf '%s\n' '{"schema":"q.worker-result.v2","root_task_id":"task-root","execution_id":"exec-root-scout","outcome":"completed"}' \
+  printf '%s\n' '{"schema":"q.worker-result.v3","root_task_id":"task-root","execution_id":"exec-root-scout","outcome":"completed"}' \
     >"$home/data/root-scout/q-result.json"
   request='{"schema":"q.firstmate-request.v1","operation":"worker.cleanup","idempotency_key":"cleanup-q-root-scout","task_id":"root-scout"}'
   out=$(printf '%s\n' "$request" | FM_HOME="$home" \
@@ -782,7 +789,12 @@ test_supervisor_operations_use_secondmate_owners_and_structured_events() {
   out=$(invoke supervisor.send "$base,"'"operation":"supervisor.send","task_id":"supervisor-1","message":"continue"}') || fail "supervisor.send failed"
   printf '%s\n' "$out" | jq -e '.result == "ok"' >/dev/null || fail "supervisor send response invalid"
   out=$(invoke supervisor.stop "$base,"'"operation":"supervisor.stop","task_id":"supervisor-1"}') || fail "supervisor.stop failed"
-  printf '%s\n' "$out" | jq -e '.postcondition_evidence.confirmed == true' >/dev/null \
+  printf '%s\n' "$out" | jq -e '
+    .postcondition_evidence.confirmed == true and
+    .postcondition_evidence.retirement_receipt.schema == "fm.retirement-receipt.v1" and
+    .postcondition_evidence.retirement_receipt.root_task_id == "task-root" and
+    .postcondition_evidence.retirement_receipt.actors[0].role == "supervisor"
+  ' >/dev/null \
     || fail "supervisor stop was not confirmed"
   pass "supervisor operations reuse secondmate owners and expose structured events"
 }
@@ -793,6 +805,27 @@ test_delivery_delegates_to_confirming_merge_owner() {
   printf '%s\n' "$out" | jq -e '.result == "ok" and .postcondition_evidence.confirmed == true and .postcondition_evidence.action == "land"' >/dev/null \
     || fail "delivery did not return a confirmed postcondition"
   pass "delivery delegates to the confirming Firstmate merge owner"
+}
+
+test_v2_delivery_delegates_exact_head_local_landing() {
+  base=1111111111111111111111111111111111111111
+  head=2222222222222222222222222222222222222222
+  request=$(jq -cn --arg base "$base" --arg head "$head" \
+    '{schema:"q.firstmate-request.v2",operation:"delivery.execute",
+      idempotency_key:"delivery-v2",task_id:"worker-v2",action:"land",mode:"local-only",
+      local_landing:{root_task_id:"task-root",repository:"/repo",worktree:"/worktree",
+        starting_revision:$base,validated_revision:$head,supervisor_child:false,
+        authority:"trusted_user_config"}}')
+  out=$(invoke delivery.execute "$request") || fail "v2 local delivery failed"
+  printf '%s\n' "$out" | jq -e --arg head "$head" '
+    .result == "ok" and .postcondition_evidence.confirmed == true and
+    .postcondition_evidence.observed_head == $head
+  ' >/dev/null || fail "v2 local delivery evidence is invalid"
+  sed -n '1p' "$HOME_ROOT/state/q-local-land-argv" | grep -Fqx worker-v2 \
+    || fail "v2 local delivery did not preserve the worker identity"
+  sed -n '7p' "$HOME_ROOT/state/q-local-land-argv" | grep -Fqx task-root \
+    || fail "v2 local delivery did not preserve the root identity"
+  pass "v2 delivery delegates exact-head automatic local landing"
 }
 
 test_capabilities_are_one_versioned_json_object
@@ -824,3 +857,4 @@ test_q_guard_reuses_facade_operation_key_across_transaction_recovery
 test_q_guard_refuses_denial_and_unavailable_contract
 test_supervisor_operations_use_secondmate_owners_and_structured_events
 test_delivery_delegates_to_confirming_merge_owner
+test_v2_delivery_delegates_exact_head_local_landing

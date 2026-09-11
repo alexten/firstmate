@@ -37,6 +37,7 @@ make_settle_fakebin() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+[ -z "${FM_FAKE_TMUX_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"
 case "$*" in
   *"#{pane_current_path}"*)
     countfile="${FM_FAKE_PANE_COUNTFILE:?FM_FAKE_PANE_COUNTFILE unset}"
@@ -110,6 +111,7 @@ run_settle_spawn() {
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_FAKE_PANE_PATH="$WT_DIR" FM_FAKE_PANE_STALE="$STALE_DIR" \
     FM_FAKE_PANE_STALE_READS="$STALE_READS" FM_FAKE_PANE_COUNTFILE="$COUNTFILE" \
+    FM_FAKE_TMUX_LOG="$HOME_DIR/tmux.log" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
@@ -218,6 +220,8 @@ test_primary_checkout_that_never_settles_fails_at_the_deadline() {
   assert_contains "$out" "repository's primary checkout" \
     "the refusal did not say why that path was rejected"
   [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "refused spawn published task metadata"
+  assert_grep "kill-window" "$HOME_DIR/tmux.log" \
+    "refused spawn left its unpublished terminal endpoint alive"
   pass "a pane stuck on the primary checkout fails loudly at the deadline"
 }
 
